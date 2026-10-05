@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400" role="img" aria-label="routeperf — per-endpoint performance and Big O for your API">
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0b1224"/><stop offset="1" stop-color="#170f36"/></linearGradient>
+  <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#39d0f5"/><stop offset="1" stop-color="#b39dfa"/></linearGradient>
+  <radialGradient id="glow1" cx="0.85" cy="0.1" r="0.6"><stop offset="0" stop-color="#7c3aed" stop-opacity="0.35"/><stop offset="1" stop-color="#7c3aed" stop-opacity="0"/></radialGradient>
+  <radialGradient id="glow2" cx="0.1" cy="1" r="0.6"><stop offset="0" stop-color="#06b6d4" stop-opacity="0.25"/><stop offset="1" stop-color="#06b6d4" stop-opacity="0"/></radialGradient>
+  <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse"><circle cx="1.5" cy="1.5" r="1.2" fill="#ffffff" fill-opacity="0.06"/></pattern>
+</defs>
+<rect width="1280" height="400" rx="24" fill="url(#bg)"/>
+<rect width="1280" height="400" rx="24" fill="url(#glow1)"/><rect width="1280" height="400" rx="24" fill="url(#glow2)"/>
+<rect width="1280" height="400" rx="24" fill="url(#dots)"/>
+<rect x="0.5" y="0.5" width="1279" height="399" rx="23.5" fill="none" stroke="#ffffff" stroke-opacity="0.10"/>
+<rect x="72" y="92" width="116" height="116" rx="28" fill="#ffffff" fill-opacity="0.05" stroke="url(#accent)" stroke-width="2.5"/>
+<polyline points="96,184 96,116" stroke="#6e7681" stroke-width="2" fill="none"/><polyline points="96,184 166,184" stroke="#6e7681" stroke-width="2" fill="none"/>
+<path d="M100,178 L162,122" stroke="#f85149" stroke-width="5" stroke-linecap="round" fill="none"/>
+<path d="M100,176 C112,162 128,159 162,156" stroke="#3fb950" stroke-width="5" stroke-linecap="round" fill="none"/>
+<circle cx="162" cy="122" r="6" fill="#f85149"/><circle cx="162" cy="156" r="6" fill="#3fb950"/>
+<text x="220" y="150" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="74" font-weight="800" fill="#ffffff" letter-spacing="-1.5">route<tspan fill="url(#accent)">perf</tspan></text>
+<text x="222" y="198" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="25" font-weight="600" fill="#d2dbe5">Per-endpoint performance &amp; Big O for your API</text>
+<text x="222" y="236" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="17" fill="#8b949e">OpenAPI spec → real requests → captured SQL → EXPLAIN ANALYZE</text>
+<text x="222" y="261" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="17" fill="#8b949e">on 1% → 100% of your data → Big O, N+1 and index fixes</text>
+<rect x="222" y="290" width="116" height="32" rx="16" fill="#79c0ff" fill-opacity="0.12" stroke="#79c0ff" stroke-opacity="0.55"/>
+<text x="280.0" y="311" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="14.5" font-weight="600" fill="#79c0ff">PostgreSQL</text>
+<rect x="348" y="290" width="73" height="32" rx="16" fill="#39d0f5" fill-opacity="0.12" stroke="#39d0f5" stroke-opacity="0.55"/>
+<text x="384.5" y="311" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="14.5" font-weight="600" fill="#39d0f5">MySQL</text>
+<rect x="431" y="290" width="141" height="32" rx="16" fill="#e3b341" fill-opacity="0.12" stroke="#e3b341" stroke-opacity="0.55"/>
+<text x="501.5" y="311" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="14.5" font-weight="600" fill="#e3b341">N+1 detection</text>
+<rect x="582" y="290" width="133" height="32" rx="16" fill="#3fb950" fill-opacity="0.12" stroke="#3fb950" stroke-opacity="0.55"/>
+<text x="648.5" y="311" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="14.5" font-weight="600" fill="#3fb950">Index advice</text>
+<rect x="725" y="290" width="73" height="32" rx="16" fill="#b39dfa" fill-opacity="0.12" stroke="#b39dfa" stroke-opacity="0.55"/>
+<text x="761.5" y="311" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="14.5" font-weight="600" fill="#b39dfa">Big O</text>
+<text x="222" y="356" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="14" fill="#6e7681">macOS · Linux · Windows   ·   single binary   ·   curl | sh install</text>
+<rect x="912" y="70" width="300" height="262" rx="18" fill="#0d1117" fill-opacity="0.65" stroke="#ffffff" stroke-opacity="0.12"/>
+<text x="932" y="102" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3">rows examined as data grows</text>
+<line x1="958" y1="286.0" x2="1190" y2="286.0" stroke="#ffffff" stroke-opacity="0.06"/>
+<line x1="958" y1="246.0" x2="1190" y2="246.0" stroke="#ffffff" stroke-opacity="0.06"/>
+<line x1="958" y1="206.0" x2="1190" y2="206.0" stroke="#ffffff" stroke-opacity="0.06"/>
+<line x1="958" y1="166.0" x2="1190" y2="166.0" stroke="#ffffff" stroke-opacity="0.06"/>
+<line x1="958" y1="126.0" x2="1190" y2="126.0" stroke="#ffffff" stroke-opacity="0.06"/>
+<text x="950" y="290.0" text-anchor="end" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" fill="#6e7681">1</text>
+<text x="950" y="231.8" text-anchor="end" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" fill="#6e7681">100</text>
+<text x="950" y="173.6" text-anchor="end" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" fill="#6e7681">10k</text>
+<text x="950" y="135.8" text-anchor="end" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" fill="#6e7681">200k</text>
+<text x="958.0" y="306" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" fill="#6e7681">1%</text>
+<text x="1016.0" y="306" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" fill="#6e7681">3%</text>
+<text x="1074.0" y="306" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" fill="#6e7681">10%</text>
+<text x="1132.0" y="306" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" fill="#6e7681">30%</text>
+<text x="1190.0" y="306" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" fill="#6e7681">100%</text>
+<polyline points="958.0,192.2 1016.0,177.6 1074.0,161.3 1132.0,147.1 1190.0,131.8" fill="none" stroke="#f85149" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="958.0" cy="192.2" r="4" fill="#0d1117" stroke="#f85149" stroke-width="2.5"/>
+<circle cx="1016.0" cy="177.6" r="4" fill="#0d1117" stroke="#f85149" stroke-width="2.5"/>
+<circle cx="1074.0" cy="161.3" r="4" fill="#0d1117" stroke="#f85149" stroke-width="2.5"/>
+<circle cx="1132.0" cy="147.1" r="4" fill="#0d1117" stroke="#f85149" stroke-width="2.5"/>
+<circle cx="1190.0" cy="131.8" r="4" fill="#0d1117" stroke="#f85149" stroke-width="2.5"/>
+<text x="1184.0" y="119.8" text-anchor="end" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#f85149">O(n) seq scan</text>
+<polyline points="958.0,272.1 1016.0,272.1 1074.0,272.1 1132.0,272.1 1190.0,272.1" fill="none" stroke="#3fb950" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="958.0" cy="272.1" r="4" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<circle cx="1016.0" cy="272.1" r="4" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<circle cx="1074.0" cy="272.1" r="4" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<circle cx="1132.0" cy="272.1" r="4" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<circle cx="1190.0" cy="272.1" r="4" fill="#0d1117" stroke="#3fb950" stroke-width="2.5"/>
+<text x="1184.0" y="260.1" text-anchor="end" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#3fb950">O(log n) index</text>
+</svg>

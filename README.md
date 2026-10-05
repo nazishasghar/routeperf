@@ -1,33 +1,48 @@
-<!-- Maintainers: run `scripts/set-repo.sh github.com/<owner>/<repo>` once before publishing.
-     It replaces every nazishasghar/routeperf placeholder below and sets the Go module path. -->
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="routeperf — per-endpoint performance and Big O for your API" width="100%">
+</p>
 
-# routeperf
+<p align="center">
+  <a href="https://github.com/nazishasghar/routeperf/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/nazishasghar/routeperf?color=7c3aed&label=release"></a>
+  <a href="https://github.com/nazishasghar/routeperf/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/nazishasghar/routeperf/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Go" src="https://img.shields.io/github/go-mod/go-version/nazishasghar/routeperf?color=00ADD8">
+  <img alt="PostgreSQL 13+" src="https://img.shields.io/badge/PostgreSQL-13%2B-336791?logo=postgresql&logoColor=white">
+  <img alt="MySQL 8.0.18+" src="https://img.shields.io/badge/MySQL-8.0.18%2B-4479A1?logo=mysql&logoColor=white">
+  <img alt="Platforms" src="https://img.shields.io/badge/macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-555">
+</p>
 
-**Per-endpoint performance and Big O for your API, measured against your real database.**
+<p align="center">
+  <b>Point it at your Swagger/OpenAPI spec, your running API and its local database.<br>
+  Get latency, DB time, queries per request, an estimated Big O and the exact fix for every endpoint.</b>
+</p>
 
-You give routeperf three things:
-- your Swagger/OpenAPI URL
-- the running API
-- the local database it uses, already loaded with bulk test data
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#reading-the-report">Reading the report</a> ·
+  <a href="#troubleshooting">Troubleshooting</a>
+</p>
 
-For every endpoint, routeperf:
-- sends real requests
-- captures the SQL the endpoint runs
-- replays that SQL with `EXPLAIN ANALYZE` on 1%→100% copies of your data
-- tells you how the endpoint scales and what to fix
-
+```bash
+curl -fsSL https://raw.githubusercontent.com/nazishasghar/routeperf/main/install.sh | sh
+routeperf init && routeperf check && routeperf run
 ```
-METHOD  ROUTE                         P50     P95      DB   Q/REQ  ROWS/REQ  BIG O                               CONF  STATUS
-GET     /users/{id}/orders          19.4ms  27.0ms  16.7ms  k + 1      200k  O(k·log n_order_items + n_orders)   high  FAIL seq scan + N+1
-GET     /users/{id}/recommendations  1.0ms   1.4ms   0.0ms  1            20  O(k^2)                              high  WARN app-side loop
-DELETE  /users/{id}                 25.3ms  32.0ms  24.3ms  1             1  O(n_orders)                         high  FAIL unindexed FK
-GET     /users/{id}                  0.8ms   1.5ms   0.0ms  1             1  O(log n_users)                      high  OK
 
-Findings
-  FAIL GET /users/{id}/orders — Seq scan on orders (200028 rows examined) filtered by user_id
-      CREATE INDEX ON orders (user_id, created_at DESC);
-  FAIL GET /users/{id}/orders — Query runs once per returned item (N+1); batch with JOIN / IN (...)
-```
+<p align="center">
+  <img src="docs/assets/demo.svg" alt="routeperf run: endpoint table with p50/p95, DB time, queries per request, rows examined, Big O, confidence and status, followed by findings with CREATE INDEX fixes" width="100%">
+</p>
+
+## How it works
+
+<p align="center">
+  <img src="docs/assets/how-it-works.svg" alt="1 read the spec, 2 call every route, 3 capture the SQL, 4 replay with EXPLAIN ANALYZE on 1%→100% data subsets, 5 Big O and fixes" width="100%">
+</p>
+
+For each endpoint, routeperf:
+- sends real requests, using your token, cookies or headers
+- captures the SQL it runs from the database's statement log
+- replays that SQL with `EXPLAIN ANALYZE` on 1%→100% copies of your data, so the growth curve shows the Big O
+- reports what to fix: missing indexes, N+1 queries, unindexed foreign keys, O(k²) loops in app code
 
 Works with **PostgreSQL 13+** and **MySQL 8.0.18+**, on macOS, Linux and Windows.
 
@@ -439,6 +454,7 @@ The design and the Big O method are described in [PLAN.md](PLAN.md).
    ```bash
    git tag v0.1.0 && git push --tags
    ```
-3. **Optional:**
+3. **Repository look:** README images live in `docs/assets/` (regenerate the SVGs with `python3 scripts/gen-images.py`). For link previews, upload `docs/assets/social-preview.png` under *Settings → General → Social preview*.
+4. **Optional:**
    - **Homebrew:** create `<owner>/homebrew-tap` and uncomment `brews:` in `.goreleaser.yaml`. Users then run `brew install <owner>/tap/routeperf`.
    - **No GitHub:** run `make release` and upload `dist/*` to any HTTP server. Users install with `ROUTEPERF_BASE_URL=https://your-server/path sh install.sh`.
