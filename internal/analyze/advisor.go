@@ -10,7 +10,14 @@ import (
 
 var colRe = regexp.MustCompile("(?i)(?:\\b(\\w+)`?\\.)?[\"`]?(\\w+)[\"`]?\\s*(?:=|<>|<=|>=|<|>|\\bIN\\b|\\bLIKE\\b|~~|\\bBETWEEN\\b|= ANY)")
 
+var (
+	castedIdent = regexp.MustCompile(`\(([\w.]+)\)::[\w ]+(?:\[\])?`) // (status)::text → status
+	castSuffix  = regexp.MustCompile(`::[a-z_][\w ]*(?:\[\])?`)       // 'paid'::text → 'paid'
+)
+
 func filterCols(f string) []string {
+	f = castedIdent.ReplaceAllString(f, "$1")
+	f = castSuffix.ReplaceAllString(f, "")
 	seen := map[string]bool{}
 	var out []string
 	for _, m := range colRe.FindAllStringSubmatch(f, -1) {
@@ -54,8 +61,74 @@ func sortCols(k string) []string {
 	return out
 }
 
+// AdviseCtx carries catalog facts the rules need.
+type AdviseCtx struct {
+	Dialect     string                         // postgres | mysql
+	TableRows   map[string]float64             // table → rows
+	UnindexedFK map[string][]string            // parent → ["child.col"]
+	Cols        map[string]map[string]bool     // table → columns
+	Indexes     map[string]map[string][]string // table → index name → ordered columns
+}
+
+var nonIdent = regexp.MustCompile(`[^a-z0-9_]+`)
+
+// IndexName builds a deterministic, length-safe index name (PG 63, MySQL 64).
+func IndexName(table string, cols []string) string {
+	var parts []string
+	for _, c := range cols {
+		parts = append(parts, strings.TrimSuffix(strings.ToLower(c), " desc"))
+	}
+	n := nonIdent.ReplaceAllString("idx_"+strings.ToLower(table)+"_"+strings.Join(parts, "_"), "_")
+	if len(n) > 60 {
+		n = n[:60]
+	}
+	return strings.TrimRight(n, "_")
+}
+
+func (a AdviseCtx) createIndex(table string, cols []string) string {
+	return fmt.Sprintf("CREATE INDEX %s ON %s (%s);", IndexName(table, cols), table, strings.Join(cols, ", "))
+}
+
+func (a AdviseCtx) analyzeSQL(table string) string {
+	if a.Dialect == "mysql" {
+		return "ANALYZE TABLE " + table + ";"
+	}
+	return "ANALYZE " + table + ";"
+}
+
+// covering returns an existing index whose leading columns are exactly cols.
+func (a AdviseCtx) covering(table string, cols []string) string {
+	for name, ic := range a.Indexes[strings.ToLower(table)] {
+		if len(ic) < len(cols) {
+			continue
+		}
+		ok := true
+		for i, c := range cols {
+			if ic[i] != strings.ToLower(strings.TrimSuffix(c, " DESC")) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return name
+		}
+	}
+	return ""
+}
+
+// leading returns an existing index that starts with col (but covers less).
+func (a AdviseCtx) leading(table, col string) (string, []string) {
+	for name, ic := range a.Indexes[strings.ToLower(table)] {
+		if len(ic) > 0 && ic[0] == strings.ToLower(strings.TrimSuffix(col, " DESC")) {
+			return name, ic
+		}
+	}
+	return "", nil
+}
+
 // Advise applies rule-based checks to a route's queries.
-func Advise(r *OpResult, tableRows map[string]float64, unindexedFK map[string][]string, cols map[string]map[string]bool) {
+func Advise(r *OpResult, ac AdviseCtx) {
+	tableRows, unindexedFK, cols := ac.TableRows, ac.UnindexedFK, ac.Cols
 	isCol := func(t, c string) bool {
 		return cols == nil || cols[strings.ToLower(t)][strings.ToLower(strings.TrimSuffix(c, " DESC"))]
 	}
@@ -79,13 +152,18 @@ func Advise(r *OpResult, tableRows map[string]float64, unindexedFK map[string][]
 			}
 		})
 		var parentFilter = map[*plan.Node]string{}
+		var filterNode = map[*plan.Node]*plan.Node{}
+		hasLimit := false
 		q.Base.Walk(func(n *plan.Node, _ int) {
 			if n.Op == plan.OpFilter {
 				for _, c := range n.Children {
 					parentFilter[c] = n.Filter
+					filterNode[c] = n
 				}
 			}
+			hasLimit = hasLimit || n.Op == plan.OpLimit
 		})
+		topN := hasLimit && sortKey != "" // ORDER BY … LIMIT: an index on (filter, sort) avoids the scan
 		q.Base.Walk(func(n *plan.Node, _ int) {
 			examined := n.Rows + n.RowsRemoved
 			switch n.Op {
@@ -105,8 +183,10 @@ func Advise(r *OpResult, tableRows map[string]float64, unindexedFK map[string][]
 					}
 				}
 				out := n.Rows
-				// MySQL puts the filter in a separate node above the scan.
-				if len(cols) > 0 && (n.RowsRemoved > 0.9*examined || out < 0.1*examined || parentFilter[n] != "") {
+				if fn := filterNode[n]; fn != nil { // MySQL: the filter is a separate node above the scan
+					out = fn.Rows
+				}
+				if len(cols) > 0 && (out <= 0.5*examined || topN) {
 					idx := cols
 					if sortKey != "" {
 						for _, s := range sortCols(sortKey) {
@@ -115,10 +195,22 @@ func Advise(r *OpResult, tableRows map[string]float64, unindexedFK map[string][]
 							}
 						}
 					}
-					add(Advice{Rule: "unindexed_filter", Query: q.ID,
-						Message:  fmt.Sprintf("Seq/table scan on %s (%.0f rows examined) filtered by %s", n.Relation, examined, strings.Join(cols, ", ")),
-						SQL:      fmt.Sprintf("CREATE INDEX ON %s (%s);", n.Relation, strings.Join(idx, ", ")),
-						Expected: fmt.Sprintf("O(log n_%s + k)", n.Relation)})
+					switch name, lead := ac.covering(n.Relation, cols), ""; {
+					case name != "":
+						add(Advice{Rule: "index_not_used", Query: q.ID,
+							Message: fmt.Sprintf("Index %s on %s (%s) exists but the planner scanned the whole table (%.0f rows): statistics may be stale or the filter isn't selective", name, n.Relation, strings.Join(cols, ", "), examined),
+							SQL:     ac.analyzeSQL(n.Relation)})
+					default:
+						if ln, lc := ac.leading(n.Relation, idx[0]); ln != "" && len(lc) < len(idx) {
+							lead = ln
+						}
+						msg := fmt.Sprintf("Seq/table scan on %s (%.0f rows examined) filtered by %s", n.Relation, examined, strings.Join(cols, ", "))
+						if lead != "" {
+							msg += fmt.Sprintf("; existing index %s covers only part of it, replace it with", lead)
+						}
+						add(Advice{Rule: "unindexed_filter", Query: q.ID, Message: msg,
+							SQL: ac.createIndex(n.Relation, idx), Expected: fmt.Sprintf("O(log n_%s + k)", n.Relation)})
+					}
 				} else if len(cols) == 0 && q.Kind == "select" {
 					add(Advice{Rule: "full_scan", Query: q.ID,
 						Message: fmt.Sprintf("Full scan of %s (%.0f rows) with no filter — inherent O(n); consider pagination, pre-aggregation or a summary table", n.Relation, examined)})
@@ -136,9 +228,18 @@ func Advise(r *OpResult, tableRows map[string]float64, unindexedFK map[string][]
 						in = in.Children[0]
 					}
 					if in.Op == plan.OpSeqScan && in.Loops > 10 {
+						var jc []string
+						for _, c := range filterCols(firstNonEmptyS(in.Filter, firstNonEmptyS(n.Filter, n.IndexCond))) {
+							if isCol(in.Relation, c) {
+								jc = append(jc, c)
+							}
+						}
+						sql := fmt.Sprintf("-- add an index on the join column of %s", in.Relation)
+						if len(jc) > 0 && ac.covering(in.Relation, jc[:1]) == "" {
+							sql = ac.createIndex(in.Relation, jc[:1])
+						}
 						add(Advice{Rule: "missing_join_index", Query: q.ID,
-							Message: fmt.Sprintf("Nested loop scans %s fully %.0f times", in.Relation, in.Loops),
-							SQL:     fmt.Sprintf("CREATE INDEX ON %s (<join column>);", in.Relation)})
+							Message: fmt.Sprintf("Nested loop scans %s fully %.0f times", in.Relation, in.Loops), SQL: sql})
 					}
 				}
 			case plan.OpSubPlan:
@@ -149,7 +250,7 @@ func Advise(r *OpResult, tableRows map[string]float64, unindexedFK map[string][]
 			if n.Scan && n.Relation != "" && n.EstRows > 0 && n.Loops > 0 {
 				act := n.Rows / n.Loops
 				if act > 100 && (act/n.EstRows > 10 || n.EstRows/act > 10) {
-					add(Advice{Rule: "stale_stats", Query: q.ID, Message: fmt.Sprintf("Row estimate %.0f vs actual %.0f on %s", n.EstRows, act, firstNonEmptyS(n.Relation, n.RawType)), SQL: "ANALYZE " + n.Relation + ";"})
+					add(Advice{Rule: "stale_stats", Query: q.ID, Message: fmt.Sprintf("Row estimate %.0f vs actual %.0f on %s", n.EstRows, act, firstNonEmptyS(n.Relation, n.RawType)), SQL: ac.analyzeSQL(n.Relation)})
 				}
 			}
 		})
@@ -162,8 +263,9 @@ func Advise(r *OpResult, tableRows map[string]float64, unindexedFK map[string][]
 		if q.Kind == "delete" || q.Kind == "update" {
 			for _, rel := range q.Base.Relations() {
 				for _, child := range unindexedFK[rel] {
-					add(Advice{Rule: "unindexed_fk", Query: q.ID, Message: fmt.Sprintf("FK %s has no index; every %s on %s scans %s", child, strings.ToUpper(q.Kind), rel, strings.SplitN(child, ".", 2)[0]),
-						SQL: fmt.Sprintf("CREATE INDEX ON %s (%s);", strings.SplitN(child, ".", 2)[0], strings.SplitN(child+".", ".", 3)[1])})
+					ct, cc, _ := strings.Cut(child, ".")
+					add(Advice{Rule: "unindexed_fk", Query: q.ID, Message: fmt.Sprintf("FK %s has no index; every %s on %s scans %s", child, strings.ToUpper(q.Kind), rel, ct),
+						SQL: ac.createIndex(ct, []string{cc})})
 				}
 			}
 		}

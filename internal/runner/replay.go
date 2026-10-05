@@ -160,6 +160,18 @@ func (r *Runner) replay(ctx context.Context, res *analyze.OpResult) {
 			res.Queries = append(res.Queries, q)
 			continue
 		}
+		mode := r.cfg.Capture.PGPlanMode
+		if r.db.Info().Dialect == "postgres" && mode != "custom" && len(ex.Params) > 0 &&
+			(mode == "generic" || (q.ObservedMs > 1 && q.ObservedMs > 3*ms)) {
+			g := ex
+			g.Generic = true
+			if gp, gw, gms, gex, err := r.explainStmt(ctx, g, ""); err == nil && gex.Generic {
+				if mode == "generic" || math.Abs(gms-q.ObservedMs) < math.Abs(ms-q.ObservedMs) {
+					p, work, ms, ex = gp, gw, gms, gex
+					q.Notes = append(q.Notes, fmt.Sprintf("the app runs this as a prepared statement with a generic plan (app %.2fms vs custom-plan replay); replays use the generic plan too", q.ObservedMs))
+				}
+			}
+		}
 		q.Example = ex
 		q.Base, q.BaseWork, q.BaseMs = p, work, ms
 		dom := dominantRel(p, ex)
@@ -340,39 +352,46 @@ func inlined(st analyze.Stmt) string {
 	return sqlutil.InlinePG(st.SQL, st.Params, nulls)
 }
 
-var idEq = regexp.MustCompile(`(?i)("?(\w+)"?\s*=\s*)'?(\d+)'?`)
+// idEq matches `[t.]col = value` with numeric, quoted string or UUID values,
+// in PG ("…") or MySQL (`…`) quoting.
+var idEq = regexp.MustCompile("(?i)(?:[`\"]?\\w+[`\"]?\\.)?[`\"]?(\\w+)[`\"]?\\s*=\\s*('(?:[^']|'')*'|\\d+)")
+
+var idColRe = regexp.MustCompile(`(?i)^(\w+?)_?id$`)
 
 // retarget swaps a missing row id (deleted/created by the app) for an anchor id
-// so DML replays exercise real rows (and FK cascades).
+// so DML replays exercise real rows (and FK cascades). Works for integer and
+// string/UUID keys.
 func (r *Runner) retarget(ctx context.Context, st analyze.Stmt) (analyze.Stmt, bool) {
 	sql := inlined(st)
-	m := idEq.FindStringSubmatchIndex(sql)
-	if m == nil {
-		return st, false
-	}
-	col := strings.ToLower(sql[m[4]:m[5]])
-	var t *db.Table
-	if col == "id" {
-		t = r.tables[sqlutil.TargetTable(sql)]
-	} else if mm := regexp.MustCompile(`^(\w+?)_?id$`).FindStringSubmatch(col); mm != nil {
-		for _, c := range []string{mm[1] + "s", mm[1], mm[1] + "es"} {
-			if r.tables[c] != nil {
-				t = r.tables[c]
-				break
+	for _, m := range idEq.FindAllStringSubmatchIndex(sql, -1) {
+		col := strings.ToLower(sql[m[2]:m[3]])
+		var t *db.Table
+		if col == "id" {
+			t = r.tables[sqlutil.TargetTable(sql)]
+			if t == nil && len(st.Tables) > 0 {
+				t = r.tables[st.Tables[0]]
+			}
+		} else if mm := idColRe.FindStringSubmatch(col); mm != nil {
+			for _, c := range []string{mm[1] + "s", mm[1], mm[1] + "es", strings.TrimSuffix(mm[1], "y") + "ies"} {
+				if r.tables[strings.ToLower(c)] != nil {
+					t = r.tables[strings.ToLower(c)]
+					break
+				}
 			}
 		}
+		if t == nil || t.PK == "" {
+			continue
+		}
+		a := r.res.Anchors(ctx, t)
+		if len(a) == 0 {
+			continue
+		}
+		out := st
+		out.SQL = sql[:m[4]] + "'" + strings.ReplaceAll(a[len(a)-1], "'", "''") + "'" + sql[m[5]:]
+		out.Params = nil
+		return out, true
 	}
-	if t == nil || t.PK == "" {
-		return st, false
-	}
-	a := r.res.Anchors(ctx, t)
-	if len(a) == 0 {
-		return st, false
-	}
-	out := st
-	out.SQL = sql[:m[6]] + a[len(a)-1] + sql[m[7]:]
-	out.Params = nil
-	return out, true
+	return st, false
 }
 
 func scanRows(p *plan.Plan) float64 {

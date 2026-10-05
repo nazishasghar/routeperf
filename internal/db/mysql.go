@@ -113,20 +113,28 @@ func (m *my) Tables(ctx context.Context) (map[string]*Table, error) {
 		}
 	}
 	cols.Close()
-	idx, err := m.db.QueryContext(ctx, `SELECT TABLE_NAME, COLUMN_NAME, INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND SEQ_IN_INDEX = 1`)
+	idx, err := m.db.QueryContext(ctx, `SELECT TABLE_NAME, COLUMN_NAME, INDEX_NAME, SEQ_IN_INDEX FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME IS NOT NULL ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX`)
 	if err != nil {
 		return nil, err
 	}
 	for idx.Next() {
 		var tn, cn, in string
-		if err := idx.Scan(&tn, &cn, &in); err != nil {
+		var seq int
+		if err := idx.Scan(&tn, &cn, &in, &seq); err != nil {
 			idx.Close()
 			return nil, err
 		}
 		if t := out[strings.ToLower(tn)]; t != nil {
-			t.Indexed[strings.ToLower(cn)] = true
-			if in == "PRIMARY" {
-				t.PK = cn
+			if t.Indexes == nil {
+				t.Indexes = map[string][]string{}
+			}
+			t.Indexes[in] = append(t.Indexes[in], strings.ToLower(cn))
+			if seq == 1 {
+				t.Indexed[strings.ToLower(cn)] = true
+				if in == "PRIMARY" {
+					t.PK = cn
+				}
 			}
 		}
 	}

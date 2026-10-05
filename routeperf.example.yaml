@@ -26,7 +26,8 @@ auth:                           # any combination
   #   refresh_on: [401]
 
 capture:
-  # pg_log_file: /opt/homebrew/var/log/postgresql@18.log   # auto-detected when omitted
+  # pg_log_file: /opt/homebrew/var/log/postgresql@18.log   # auto-detected when omitted (or docker:<container>)
+  pg_plan_mode: auto            # auto: use a generic plan when the app's prepared statements do | custom | generic
   settle: 40ms
 
 run:

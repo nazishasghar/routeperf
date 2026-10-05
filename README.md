@@ -308,8 +308,9 @@ Useful `run` flags:
 | `-o dir` | output directory |
 | `--ci` | exit code 2 if any endpoint FAILs |
 | `--non-interactive` | never prompt |
+| `--pg-plan-mode auto\|custom\|generic` | Postgres replay plans. `auto` (default) detects when the app's prepared statements run a generic plan and replays the same way |
 
-Global flags: `--spec --api-url --db-url --token -H -b --cookie-jar --pg-log-file --config --allow-remote-db -v`.
+Global flags: `--spec --api-url --db-url --token -H -b --cookie-jar --pg-log-file --pg-plan-mode --config --allow-remote-db -v`.
 
 ---
 
@@ -339,6 +340,14 @@ So `O(k·log n_order_items + n_orders)` means: one full scan of `orders`, plus `
 Confidence is high when the signals agree, the fit is tight (R² ≥ 0.95), the data spans 1.5+ orders of magnitude, and the plan stays the same across scales. When the planner switches plans at some data size, the report says where.
 
 `report.md` also projects p50 at 10× and 100× your current data, from the fitted curves.
+
+**Background traffic.** Before the run and before each endpoint, routeperf watches the database while it sends nothing. Any SQL seen in that window comes from background workers, cron jobs or other clients. Those query shapes are left out of every endpoint's numbers, and the report says what was excluded.
+
+**Prepared statements (Postgres).** Apps that use prepared statements switch to a *generic* plan after a few executions. routeperf compares the app's real timing with its replay. When they differ by more than 3×, it replays with the generic plan too and notes this in the report. Force a mode with `--pg-plan-mode`.
+
+**Index advice:**
+- It is ready to run on your database: named indexes valid on both Postgres and MySQL (`CREATE INDEX idx_orders_user_id_created_at ON orders (user_id, created_at DESC);`).
+- It is checked against your existing indexes. When an index already covers the filter but wasn't used, routeperf suggests `ANALYZE` instead of a duplicate index. When an existing index covers only part of the filter, it says which one to replace.
 
 ---
 
@@ -393,6 +402,7 @@ If a run is killed with `kill -9` or a crash, run `routeperf repair`.
 | `App → DB link ✗ … issued no SQL to this database` | The API uses a different DB than `--db-url`; compare it with the API's `DATABASE_URL` |
 | `Test data ! largest table has 800 rows` | Load more bulk data; growth can't be measured on tiny tables |
 | `Previous run ! pending state` | Run `routeperf repair` |
+| `Quiet DB ! N statement(s) … while idle` | Background jobs are hitting the DB. routeperf excludes those query shapes, but stopping workers or cron jobs gives the cleanest numbers |
 | An endpoint shows many non-2xx responses | Inputs were invalid: add a fixture for that `operationId` |
 
 ---
@@ -402,7 +412,7 @@ If a run is killed with `kill -9` or a crash, run `routeperf repair`.
 - App code that does CPU work without touching the database is visible only through the output-scale test, where it shows up as app time growing with `k`.
 - Caches in the app (Redis, ORM identity maps) can hide queries on repeated requests.
 - Exponential growth isn't modelled. Big O is an empirical estimate with a confidence level, not a proof.
-- One request is in flight at a time, because that's how SQL is attributed to endpoints. Other traffic on the same database during a run adds noise.
+- One request is in flight at a time, because that's how SQL is attributed to endpoints. Background SQL is detected and excluded by query shape. An endpoint that runs exactly the same query shape as a background job can lose that statement from its count.
 
 ---
 
@@ -411,6 +421,9 @@ If a run is killed with `kill -9` or a crash, run `routeperf repair`.
 ```bash
 make build          # bin/routeperf
 make test           # go vet + unit tests
+# end-to-end: seeds the testbed in both DBs, runs routeperf, asserts every planted problem + fix
+RP_IT_PG=postgres://localhost:5432/routeperf_it RP_IT_MYSQL=mysql://root@127.0.0.1:3306/routeperf_it \
+  go test -tags integration -v -timeout 20m ./integration/
 make testbed        # sample API with planted problems, for end-to-end checks
 make testbed-seed DB=postgres://localhost:5432/routeperf_testbed
 bin/testbed --db-url postgres://localhost:5432/routeperf_testbed --addr :8088 &
@@ -419,6 +432,8 @@ bin/routeperf run --spec http://localhost:8088/swagger.json --api-url http://loc
 ```
 
 The testbed supports MySQL as well (`--db-url mysql://root@127.0.0.1:3306/routeperf_testbed`). It accepts `Bearer testtoken`, `X-Api-Key: testkey`, cookie `session=testsession`, or `POST /auth/login` with `{"email":"perf@test.dev","password":"secret"}`. Its planted problems are:
+- background job noise (`--background-noise 120ms`)
+- UUID primary keys (`/notes`)
 - an unindexed filter
 - an N+1 query
 - an unindexed FK cascade
@@ -439,6 +454,7 @@ internal/analyze      curve fitting, plan algebra, verdicts, advisor
 internal/runner       doctor (check) and the run lifecycle
 internal/report       terminal, Markdown, JSON
 testbed/              sample API with planted problems
+integration/          end-to-end test against real Postgres + MySQL (go test -tags integration)
 ```
 
 The design and the Big O method are described in [PLAN.md](PLAN.md).

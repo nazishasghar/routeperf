@@ -232,6 +232,12 @@ func (r *Runner) Doctor(ctx context.Context) []Check {
 			add("SQL capture", "fail", err.Error(), captureFix(info.Dialect))
 		} else {
 			add("SQL capture", "ok", "statement log readable: "+r.db.LogSource(), "")
+			if n := r.idleProbe(ctx, time.Second); n > 0 {
+				add("Quiet DB", "warn", fmt.Sprintf("%d statement(s) in 1s from other clients/jobs while idle; those query shapes will be excluded from endpoint numbers", n),
+					"stop background workers/cron jobs during the run for the cleanest numbers")
+			} else {
+				add("Quiet DB", "ok", "no background SQL while idle", "")
+			}
 			if apiUp {
 				add(r.appUsesDB(ctx))
 			}

@@ -67,6 +67,28 @@ type Runner struct {
 	baseURL *url.URL
 	result  *Result
 	nsSteps []float64
+	bg      map[string]string // fingerprints seen while no request was in flight
+}
+
+// idleProbe watches the statement log while routeperf sends nothing; any SQL
+// seen comes from background jobs or other clients and is excluded later.
+func (r *Runner) idleProbe(ctx context.Context, d time.Duration) int {
+	m0, err := r.db.Mark(ctx)
+	if err != nil {
+		return 0
+	}
+	time.Sleep(d)
+	m1, _ := r.db.Mark(ctx)
+	stmts, _ := r.db.Window(ctx, m0, m1)
+	if r.bg == nil {
+		r.bg = map[string]string{}
+	}
+	for _, st := range stmts {
+		if st.Kind != "other" {
+			r.bg[st.Fingerprint] = st.SQL
+		}
+	}
+	return len(stmts)
 }
 
 func New(cfg *Config, logf func(string, ...any)) *Runner {
@@ -239,6 +261,17 @@ func (r *Runner) request(ctx context.Context, req *inputs.Request, k int) (analy
 	if err != nil {
 		s.Err = "capture: " + err.Error()
 	}
+	if len(r.bg) > 0 { // quiet check: drop statements that background traffic produces
+		kept := stmts[:0]
+		for _, st := range stmts {
+			if _, isBG := r.bg[st.Fingerprint]; isBG {
+				s.Noise++
+				continue
+			}
+			kept = append(kept, st)
+		}
+		stmts = kept
+	}
 	s.Status, s.Ms, s.Bytes, s.Stmts, s.NStmts = status, ms, len(body), stmts, len(stmts)
 	return s, body, hdr
 }
@@ -309,11 +342,15 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 	}
 	defer stopCapture()
 
+	if n := r.idleProbe(ctx, 1500*time.Millisecond); n > 0 {
+		r.log("background SQL detected while idle (%d statements); those query shapes are excluded", n)
+	}
 	var results []*analyze.OpResult
 	for _, o := range reads {
 		if ctx.Err() != nil {
 			break
 		}
+		r.idleProbe(ctx, 250*time.Millisecond)
 		results = append(results, r.runOp(ctx, o))
 	}
 
@@ -360,6 +397,7 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 			if ctx.Err() != nil {
 				break
 			}
+			r.idleProbe(ctx, 250*time.Millisecond)
 			res := r.runWrite(ctx, o, writes)
 			if res != nil {
 				results = append(results, res)
@@ -446,6 +484,11 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 			colSet[n][strings.ToLower(cn)] = true
 		}
 	}
+	idxSet := map[string]map[string][]string{}
+	for n, t := range r.tables {
+		idxSet[n] = t.Indexes
+	}
+	adviseCtx := analyze.AdviseCtx{Dialect: r.db.Info().Dialect, TableRows: tableRows, UnindexedFK: unindexed, Cols: colSet, Indexes: idxSet}
 	for _, res := range results {
 		for _, q := range res.Queries {
 			if q.Kind == "delete" || q.Kind == "update" {
@@ -456,7 +499,21 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 			analyze.AnalyzeQuery(q, tableRows)
 		}
 		analyze.AnalyzeRoute(res, c.Thresholds.P95Ms, c.Thresholds.MaxQueries)
-		analyze.Advise(res, tableRows, unindexed, colSet)
+		analyze.Advise(res, adviseCtx)
+	}
+	if len(r.bg) > 0 {
+		var shapes []string
+		for _, q := range r.bg {
+			shapes = append(shapes, truncateSQL(q, 80))
+		}
+		sort.Strings(shapes)
+		noise := 0
+		for _, res := range results {
+			for _, s := range append(res.Samples, flatten(res.KSamples)...) {
+				noise += s.Noise
+			}
+		}
+		r.result.Warnings = append(r.result.Warnings, fmt.Sprintf("background SQL from other clients/jobs was detected; %d statement(s) of these shapes were excluded from endpoint numbers: %s", noise, strings.Join(shapes, " | ")))
 	}
 	r.result.Ops = results
 	r.result.Unresolved = r.res.Unresolved
@@ -477,6 +534,14 @@ func (r *Runner) verifyRestore(ts []*db.Table) bool {
 		}
 	}
 	return ok
+}
+
+func truncateSQL(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 func flatten(m map[int][]analyze.Sample) []analyze.Sample {

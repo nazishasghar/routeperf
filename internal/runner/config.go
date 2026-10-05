@@ -24,8 +24,9 @@ type Config struct {
 	} `yaml:"db"`
 	Auth    auth.Config `yaml:"auth"`
 	Capture struct {
-		PGLogFile string `yaml:"pg_log_file"`
-		Settle    string `yaml:"settle"`
+		PGLogFile  string `yaml:"pg_log_file"`
+		PGPlanMode string `yaml:"pg_plan_mode"` // auto | custom | generic
+		Settle     string `yaml:"settle"`
 	} `yaml:"capture"`
 	Run struct {
 		Methods      []string `yaml:"methods"`
@@ -89,6 +90,9 @@ func LoadConfig(path string) (*Config, error) {
 func (c *Config) Defaults() {
 	if c.API.Timeout == "" {
 		c.API.Timeout = "30s"
+	}
+	if c.Capture.PGPlanMode == "" {
+		c.Capture.PGPlanMode = "auto"
 	}
 	if c.Capture.Settle == "" {
 		c.Capture.Settle = "40ms"
@@ -193,7 +197,8 @@ auth:                           # any combination
   #   refresh_on: [401]
 
 capture:
-  # pg_log_file: /opt/homebrew/var/log/postgresql@18.log   # auto-detected when omitted
+  # pg_log_file: /opt/homebrew/var/log/postgresql@18.log   # auto-detected when omitted (or docker:<container>)
+  pg_plan_mode: auto            # auto: use a generic plan when the app's prepared statements do | custom | generic
   settle: 40ms
 
 run:

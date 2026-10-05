@@ -14,7 +14,8 @@ type Stmt struct {
 	SQL         string   `json:"sql"`
 	Params      []string `json:"params,omitempty"`
 	DurMs       float64  `json:"dur_ms,omitempty"`
-	Kind        string   `json:"kind"` // select|insert|update|delete|other
+	Kind        string   `json:"kind"`              // select|insert|update|delete|other
+	Generic     bool     `json:"generic,omitempty"` // replay with a generic (prepared-statement) plan
 	Fingerprint string   `json:"fp"`
 	Tables      []string `json:"tables,omitempty"`
 }
@@ -26,6 +27,7 @@ type Sample struct {
 	Bytes  int     `json:"bytes"`
 	Stmts  []Stmt  `json:"-"`
 	NStmts int     `json:"stmts"`
+	Noise  int     `json:"background_excluded,omitempty"`
 	Err    string  `json:"err,omitempty"`
 }
 

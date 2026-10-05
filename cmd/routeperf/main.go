@@ -27,11 +27,11 @@ import (
 )
 
 type flags struct {
-	config, spec, api, dbURL, token, cookieJar, out, pgLog string
-	headers, cookies, only, exclude                        []string
-	yes, noWrites, noScale, allowRemote, verbose, nonInter bool
-	ci                                                     bool
-	iterations                                             int
+	config, spec, api, dbURL, token, cookieJar, out, pgLog, planMode string
+	headers, cookies, only, exclude                                  []string
+	yes, noWrites, noScale, allowRemote, verbose, nonInter           bool
+	ci                                                               bool
+	iterations                                                       int
 }
 
 var f flags
@@ -69,6 +69,7 @@ Start with:  routeperf init   →   routeperf check   →   routeperf run`,
 	pf.StringArrayVarP(&f.cookies, "cookie", "b", nil, "cookie 'name=value' (repeatable)")
 	pf.StringVar(&f.cookieJar, "cookie-jar", "", "Netscape/curl cookie file")
 	pf.StringVar(&f.pgLog, "pg-log-file", "", "Postgres stderr log path or docker:<container> (auto-detected)")
+	pf.StringVar(&f.planMode, "pg-plan-mode", "", "Postgres replay plans: auto (match the app's prepared statements) | custom | generic")
 	pf.BoolVar(&f.allowRemote, "allow-remote-db", false, "allow a non-local database (disposable test DBs only)")
 	pf.BoolVar(&f.nonInter, "non-interactive", false, "never prompt")
 	pf.BoolVarP(&f.verbose, "verbose", "v", false, "verbose logs")
@@ -127,6 +128,9 @@ func loadConfig(ask bool) (*runner.Config, error) {
 	}
 	if f.pgLog != "" {
 		cfg.Capture.PGLogFile = f.pgLog
+	}
+	if f.planMode != "" {
+		cfg.Capture.PGPlanMode = f.planMode
 	}
 	for _, h := range f.headers {
 		k, v, ok := strings.Cut(h, ":")

@@ -125,12 +125,41 @@ WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_sch
 		}
 		out[strings.ToLower(t.Name)] = t
 	}
+	rows.Close()
+	ir, err := p.pool.Query(ctx, `
+SELECT c.relname, ic.relname,
+  ARRAY(SELECT a.attname FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, ord)
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum ORDER BY k.ord)
+FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid JOIN pg_class ic ON ic.oid = i.indexrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE '\_rp\_%'`)
+	if err != nil {
+		return nil, err
+	}
+	for ir.Next() {
+		var tn, in string
+		var cols []string
+		if err := ir.Scan(&tn, &in, &cols); err != nil {
+			ir.Close()
+			return nil, err
+		}
+		if t := out[strings.ToLower(tn)]; t != nil {
+			if t.Indexes == nil {
+				t.Indexes = map[string][]string{}
+			}
+			for i := range cols {
+				cols[i] = strings.ToLower(cols[i])
+			}
+			t.Indexes[in] = cols
+		}
+	}
+	ir.Close()
 	for _, t := range out {
 		if t.Rows == 0 {
 			_ = p.pool.QueryRow(ctx, fmt.Sprintf("SELECT count(*)::float8 FROM %s.%s", qpg(t.Schema), qpg(t.Name))).Scan(&t.Rows)
 		}
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (p *pg) FKs(ctx context.Context, tables map[string]*Table) ([]FK, error) {
@@ -176,10 +205,25 @@ func (p *pg) FirstValues(ctx context.Context, sql string) ([]string, error) {
 			return nil, err
 		}
 		if len(vals) > 0 {
-			out = append(out, fmt.Sprint(vals[0]))
+			out = append(out, pgText(vals[0]))
 		}
 	}
 	return out, rows.Err()
+}
+
+// pgText renders a scanned value the way Postgres would print it as text.
+func pgText(v any) string {
+	switch x := v.(type) {
+	case [16]byte: // uuid
+		return fmt.Sprintf("%x-%x-%x-%x-%x", x[0:4], x[4:6], x[6:8], x[8:10], x[10:16])
+	case []byte:
+		return string(x)
+	case time.Time:
+		return x.Format(time.RFC3339Nano)
+	case nil:
+		return ""
+	}
+	return fmt.Sprint(v)
 }
 
 // ---------------------------------------------------------------- capture
@@ -437,6 +481,41 @@ func (p *pg) Explain(ctx context.Context, st analyze.Stmt, ns string, tables map
 		}
 	}
 	var out string
+	if st.Generic && len(st.Params) > 0 {
+		// Prepared statements in the app switch to a generic plan after 5
+		// executions; replay the same way so plans and timings match.
+		raw := st.SQL
+		if ns != "" {
+			for _, t := range st.Tables {
+				if tb := tables[t]; tb != nil {
+					raw = sqlutil.RewriteSchema(raw, tb.Schema, ns, []string{tb.Name})
+				}
+			}
+		}
+		name := fmt.Sprintf("rp_g%d", time.Now().UnixNano())
+		var args []string
+		for _, v := range st.Params {
+			if IsNull(v) {
+				args = append(args, "NULL")
+			} else {
+				args = append(args, "'"+strings.ReplaceAll(v, "'", "''")+"'")
+			}
+		}
+		if _, err := tx.Exec(ctx, "SET LOCAL plan_cache_mode = force_generic_plan"); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, "PREPARE "+name+" AS "+raw); err == nil {
+			defer p.ex.Exec(context.Background(), "DEALLOCATE "+name)
+			if err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE "+name+"("+strings.Join(args, ", ")+")", pgx.QueryExecModeSimpleProtocol).Scan(&out); err != nil {
+				return nil, err
+			}
+			return plan.ParsePostgresJSON([]byte(out))
+		}
+		// parameter types not inferable → fall back to a custom plan in a fresh tx
+		tx.Rollback(ctx)
+		st.Generic = false
+		return p.Explain(ctx, st, ns, tables)
+	}
 	if err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+sql, pgx.QueryExecModeSimpleProtocol).Scan(&out); err != nil {
 		return nil, err
 	}

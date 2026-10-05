@@ -60,3 +60,13 @@ func TestExprSimplify(t *testing.T) {
 		t.Errorf("got %s", got)
 	}
 }
+
+func TestFilterColsCasts(t *testing.T) {
+	got := filterCols("((status)::text = 'paid'::text) AND (o.user_id = '42'::bigint)")
+	if len(got) != 2 || got[0] != "status" || got[1] != "user_id" {
+		t.Fatalf("got %v", got)
+	}
+	if n := IndexName("orders", []string{"user_id", "created_at DESC"}); n != "idx_orders_user_id_created_at" {
+		t.Fatal(n)
+	}
+}

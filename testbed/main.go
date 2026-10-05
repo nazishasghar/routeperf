@@ -37,6 +37,7 @@ func main() {
 	opu := flag.Int("orders-per-user", 10, "orders per user")
 	ipo := flag.Int("items-per-order", 3, "items per order")
 	spu := flag.Int("sessions-per-user", 2, "sessions per user")
+	noise := flag.Duration("background-noise", 0, "run a background query at this interval (simulates a cron job), e.g. 100ms")
 	flag.Parse()
 	if *dbURL == "" {
 		log.Fatal("--db-url required")
@@ -74,6 +75,14 @@ func main() {
 		}
 		return
 	}
+	if *noise > 0 {
+		go func() { // simulated background job hitting the same DB
+			for range time.Tick(*noise) {
+				var n int
+				_ = db.QueryRow("SELECT COUNT(*) FROM sessions WHERE token LIKE 'a%'").Scan(&n)
+			}
+		}()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]any{"ok": true}) })
 	mux.HandleFunc("GET /swagger.json", func(w http.ResponseWriter, r *http.Request) {
@@ -92,6 +101,10 @@ func main() {
 	mux.HandleFunc("POST /orders", authed(createOrder))
 	mux.HandleFunc("GET /orders/search", authed(searchOrders))
 	mux.HandleFunc("GET /reports/sales", authed(salesReport))
+	mux.HandleFunc("POST /notes", authed(createNote))
+	mux.HandleFunc("GET /notes/{id}", authed(getNote))
+	mux.HandleFunc("PUT /notes/{id}", authed(updateNote))
+	mux.HandleFunc("DELETE /notes/{id}", authed(deleteNote))
 	log.Printf("testbed (%s) listening on %s", dialect, *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }
@@ -151,7 +164,7 @@ func seedData(u, opu, ipo, spu int) {
 	var stmts []string
 	if dialect == "postgres" {
 		stmts = []string{
-			"DROP TABLE IF EXISTS order_items, orders, sessions, users CASCADE",
+			"DROP TABLE IF EXISTS notes, order_items, orders, sessions, users CASCADE",
 			"CREATE TABLE users (id bigserial PRIMARY KEY, email varchar(255) NOT NULL UNIQUE, name varchar(100), country char(2), created_at timestamp NOT NULL DEFAULT now())",
 			// planted: orders.user_id FK without index
 			"CREATE TABLE orders (id bigserial PRIMARY KEY, user_id bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE, status varchar(16) NOT NULL, total_cents int NOT NULL, created_at timestamp NOT NULL)",
@@ -163,7 +176,11 @@ func seedData(u, opu, ipo, spu int) {
 			fmt.Sprintf(`INSERT INTO orders (user_id, status, total_cents, created_at) SELECT 1 + (g %% %d), (ARRAY['paid','pending','refunded','shipped'])[1+(g*7)%%4], (g*37)%%50000+100, now() - ((g*13)%%730) * interval '1 day' - (g%%86400) * interval '1 second' FROM generate_series(1,%d) g`, u, u*opu),
 			fmt.Sprintf(`INSERT INTO order_items (order_id, sku, qty, price_cents) SELECT 1 + (g %% %d), 'SKU-'||(g%%500), 1+g%%5, (g*17)%%10000 FROM generate_series(1,%d) g`, u*opu, u*opu*ipo),
 			fmt.Sprintf(`INSERT INTO sessions (user_id, token, created_at) SELECT 1 + (g %% %d), md5(g::text), now() FROM generate_series(1,%d) g`, u, u*spu),
-			"ANALYZE users", "ANALYZE orders", "ANALYZE order_items", "ANALYZE sessions",
+			// UUID-keyed resource (indexed FK)
+			"CREATE TABLE notes (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE, body text NOT NULL, created_at timestamp NOT NULL DEFAULT now())",
+			"CREATE INDEX notes_user_id_idx ON notes(user_id)",
+			fmt.Sprintf(`INSERT INTO notes (user_id, body) SELECT g, 'note '||g FROM generate_series(1,%d) g`, u),
+			"ANALYZE users", "ANALYZE orders", "ANALYZE order_items", "ANALYZE sessions", "ANALYZE notes",
 		}
 	} else {
 		seq := func(n int) string {
@@ -171,7 +188,7 @@ func seedData(u, opu, ipo, spu int) {
 		}
 		stmts = []string{
 			"SET SESSION cte_max_recursion_depth = 100000000",
-			"DROP TABLE IF EXISTS order_items, orders, sessions, users",
+			"DROP TABLE IF EXISTS notes, order_items, orders, sessions, users",
 			"CREATE TABLE users (id BIGINT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(255) NOT NULL UNIQUE, name VARCHAR(100), country CHAR(2), created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)",
 			// planted: no index (and no FK, which would auto-index) on orders.user_id
 			"CREATE TABLE orders (id BIGINT AUTO_INCREMENT PRIMARY KEY, user_id BIGINT NOT NULL, status VARCHAR(16) NOT NULL, total_cents INT NOT NULL, created_at DATETIME NOT NULL)",
@@ -181,7 +198,9 @@ func seedData(u, opu, ipo, spu int) {
 			fmt.Sprintf("INSERT INTO orders (user_id, status, total_cents, created_at) %s SELECT 1 + (g %% %d), ELT(1+(g*7)%%4,'paid','pending','refunded','shipped'), (g*37)%%50000+100, NOW() - INTERVAL ((g*13)%%730) DAY - INTERVAL (g%%86400) SECOND FROM seq", seq(u*opu), u),
 			fmt.Sprintf("INSERT INTO order_items (order_id, sku, qty, price_cents) %s SELECT 1 + (g %% %d), CONCAT('SKU-', g%%500), 1+g%%5, (g*17)%%10000 FROM seq", seq(u*opu*ipo), u*opu),
 			fmt.Sprintf("INSERT INTO sessions (user_id, token, created_at) %s SELECT 1 + (g %% %d), MD5(g), NOW() FROM seq", seq(u*spu), u),
-			"ANALYZE TABLE users, orders, order_items, sessions",
+			"CREATE TABLE notes (id CHAR(36) PRIMARY KEY, user_id BIGINT NOT NULL, body TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, KEY notes_user_id_idx (user_id))",
+			fmt.Sprintf("INSERT INTO notes (id, user_id, body) %s SELECT UUID(), g, CONCAT('note ', g) FROM seq", seq(u)),
+			"ANALYZE TABLE users, orders, order_items, sessions, notes",
 		}
 	}
 	conn, err := db.Conn(context.Background())
@@ -560,6 +579,73 @@ func salesReport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
+type Note struct {
+	ID     string `json:"id"`
+	UserID int64  `json:"user_id"`
+	Body   string `json:"body"`
+}
+
+func createNote(w http.ResponseWriter, r *http.Request) {
+	var n Note
+	if err := json.NewDecoder(r.Body).Decode(&n); err != nil || n.UserID == 0 {
+		fail(w, 400, "user_id and body required")
+		return
+	}
+	var err error
+	if dialect == "postgres" {
+		err = db.QueryRow("INSERT INTO notes (user_id, body) VALUES ($1, $2) RETURNING id", n.UserID, n.Body).Scan(&n.ID)
+	} else {
+		_ = db.QueryRow("SELECT UUID()").Scan(&n.ID)
+		_, err = db.Exec("INSERT INTO notes (id, user_id, body) VALUES (?, ?, ?)", n.ID, n.UserID, n.Body)
+	}
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 201, n)
+}
+
+func getNote(w http.ResponseWriter, r *http.Request) {
+	var n Note
+	err := db.QueryRow(q("SELECT id, user_id, body FROM notes WHERE id = ?"), r.PathValue("id")).Scan(&n.ID, &n.UserID, &n.Body)
+	if err == sql.ErrNoRows {
+		fail(w, 404, "not found")
+		return
+	} else if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, n)
+}
+
+func updateNote(w http.ResponseWriter, r *http.Request) {
+	var n Note
+	_ = json.NewDecoder(r.Body).Decode(&n)
+	res, err := db.Exec(q("UPDATE notes SET body = ? WHERE id = ?"), n.Body, r.PathValue("id"))
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	if c, _ := res.RowsAffected(); c == 0 {
+		fail(w, 404, "not found")
+		return
+	}
+	getNote(w, r)
+}
+
+func deleteNote(w http.ResponseWriter, r *http.Request) {
+	res, err := db.Exec(q("DELETE FROM notes WHERE id = ?"), r.PathValue("id"))
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	if c, _ := res.RowsAffected(); c == 0 {
+		fail(w, 404, "not found")
+		return
+	}
+	w.WriteHeader(204)
+}
+
 // planted: one INSERT per item
 func createOrder(w http.ResponseWriter, r *http.Request) {
 	var o Order
@@ -667,6 +753,15 @@ const specJSON = `{
         "responses": {"201": {"description": "created"}}}},
     "/orders/search": {"get": {"operationId": "searchOrders", "parameters": [{"name": "status", "in": "query", "schema": {"type": "string", "enum": ["paid", "pending", "refunded", "shipped"]}}, {"$ref": "#/components/parameters/limit"}],
       "responses": {"200": {"description": "orders"}}}},
+    "/notes": {"post": {"operationId": "createNote", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["user_id", "body"], "properties": {
+        "user_id": {"type": "integer"}, "body": {"type": "string", "example": "remember the milk"}}}}}},
+      "responses": {"201": {"description": "created"}}}},
+    "/notes/{id}": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+      "get": {"operationId": "getNote", "responses": {"200": {"description": "note"}}},
+      "put": {"operationId": "updateNote", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"body": {"type": "string", "example": "edited"}}}}}},
+        "responses": {"200": {"description": "updated"}}},
+      "delete": {"operationId": "deleteNote", "responses": {"204": {"description": "deleted"}}}},
     "/reports/sales": {"get": {"operationId": "salesReport", "parameters": [{"name": "from", "in": "query", "schema": {"type": "string", "format": "date"}, "example": "2000-01-01"}, {"name": "to", "in": "query", "schema": {"type": "string", "format": "date"}, "example": "2100-01-01"}],
       "responses": {"200": {"description": "daily sales"}}}}
   }

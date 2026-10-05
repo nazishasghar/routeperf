@@ -21,8 +21,9 @@ type Table struct {
 	Name    string
 	PK      string
 	Rows    float64
-	Cols    []string        // insertable columns, in order
-	Indexed map[string]bool // leading index columns
+	Cols    []string            // insertable columns, in order
+	Indexed map[string]bool     // leading index columns
+	Indexes map[string][]string // index name → ordered columns (lowercase)
 }
 
 type FK struct {
