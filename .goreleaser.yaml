@@ -1,0 +1,31 @@
+# GoReleaser: `git tag v0.1.0 && git push --tags` → the release workflow publishes binaries.
+version: 2
+project_name: routeperf
+builds:
+  - main: ./cmd/routeperf
+    binary: routeperf
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X {{ .ModulePath }}/internal/version.Version={{ .Version }}
+      - -X {{ .ModulePath }}/internal/version.Commit={{ .ShortCommit }} -X {{ .ModulePath }}/internal/version.Date={{ .Date }}
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+archives:
+  - name_template: "routeperf_{{ .Os }}_{{ .Arch }}"   # stable names → install.sh can use /releases/latest/download
+    wrap_in_directory: true
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files: [README.md, routeperf.example.yaml]
+checksum:
+  name_template: checksums.txt
+changelog:
+  sort: asc
+# Homebrew: uncomment after creating github.com/nazishasghar/homebrew-tap (then: brew install nazishasghar/tap/routeperf)
+# brews:
+#   - repository: { owner: nazishasghar, name: homebrew-tap }
+#     homepage: https://github.com/nazishasghar/routeperf
+#     description: Per-route performance and Big O from an OpenAPI spec + EXPLAIN ANALYZE
+#     test: system "#{bin}/routeperf", "version"

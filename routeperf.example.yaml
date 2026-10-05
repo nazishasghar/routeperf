@@ -1,0 +1,54 @@
+# routeperf configuration. Values support ${ENV_VAR} and ${ENV_VAR:-default}.
+spec: http://localhost:3000/swagger.json
+api:
+  base_url: http://localhost:3000
+  timeout: 30s
+db:
+  url: ${DATABASE_URL}          # postgres://user@localhost:5432/app  or  mysql://root@127.0.0.1:3306/app
+  allow_remote: false           # never point at production
+
+auth:                           # any combination
+  bearer: ${API_TOKEN:-}
+  headers: {}                   # e.g. { X-Tenant-Id: acme, X-Api-Key: "${API_KEY}" }
+  cookies: {}                   # e.g. { session: "${SESSION_COOKIE}" }
+  # cookie_jar: ./cookies.txt   # Netscape/curl format
+  # query: { api_key: "${API_KEY}" }
+  # oauth2_client_credentials:
+  #   token_url: http://localhost:3000/oauth/token
+  #   client_id: ${CLIENT_ID}
+  #   client_secret: ${CLIENT_SECRET}
+  #   scope: "read write"
+  # login:
+  #   method: POST
+  #   path: /auth/login
+  #   body: { email: perf@test.dev, password: "${PERF_PASSWORD}" }
+  #   extract: { cookies: true, bearer_from: "$.data.accessToken" }
+  #   refresh_on: [401]
+
+capture:
+  # pg_log_file: /opt/homebrew/var/log/postgresql@18.log   # auto-detected when omitted
+  settle: 40ms
+
+run:
+  methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
+  warmup: 2
+  iterations: 10
+  k_iterations: 3
+  include: []                   # operationIds or tag:<name>
+  exclude: []
+  dangerous_ops: []             # collection deletes / reset endpoints must be listed to run
+
+scale:
+  data_steps: [0.01, 0.03, 0.10, 0.30, 1.0]
+  k_steps: [1, 10, 100, 250, 500, 1000]
+  repeats: 3
+
+writes:
+  snapshot: tables              # tables | none
+
+thresholds:
+  p95_ms: 300
+  max_queries_per_request: 10
+
+fixtures: fixtures.yaml
+out: routeperf-out
