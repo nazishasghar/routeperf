@@ -31,6 +31,7 @@ type Table struct {
 	PKCols  []string
 	Rows    float64
 	Cols    []string            // insertable columns, in order
+	NotNull map[string]bool     // NOT NULL columns (lowercase)
 	Indexed map[string]bool     // leading index columns
 	Indexes map[string][]string // index name → ordered columns (lowercase)
 	ViewDef string              // views: defining SELECT
@@ -56,6 +57,10 @@ type FK struct {
 	ChildCols, ParentCols              []string
 	Declared, Indexed                  bool
 	OnDelete                           string
+	// Deferred marks an FK that closes a cycle (self-reference, or tables
+	// referencing each other): no load order satisfies it, so subsets sample
+	// the child without it. See MarkCycles.
+	Deferred bool
 }
 
 type Mark struct {
@@ -339,7 +344,131 @@ func fkIndexed(t *Table, cols []string) bool {
 	return false
 }
 
-// TopoOrder returns tables parents-first within scope.
+// MarkCycles flags the FKs that close a cycle: self-references
+// (category.parent_id) and tables that reference each other
+// (customer.primary_member_id ⇄ member.customer_id). No load order satisfies
+// them, so subsets sample the child without them and keep its values as they
+// are (possibly dangling). Within a cycle, tables are ordered so NOT NULL
+// references hold (usually member.customer_id: members follow their
+// customer into a subset) and the nullable one pointing back is deferred;
+// otherwise the smaller table loads first. The choice depends only on the
+// catalog, so the subset builder and the anchor sampler agree on it.
+func MarkCycles(tables map[string]*Table, fks []FK) []FK {
+	adj := map[string][]string{}
+	var nodes []string
+	seen := map[string]bool{}
+	for _, f := range fks {
+		for _, n := range []string{f.Child, f.Parent} {
+			if !seen[n] {
+				seen[n] = true
+				nodes = append(nodes, n)
+			}
+		}
+		if f.Child != f.Parent {
+			adj[f.Child] = append(adj[f.Child], f.Parent)
+		}
+	}
+	sort.Strings(nodes)
+	// Tarjan's strongly connected components
+	comp := map[string]int{}
+	index, low, onStack := map[string]int{}, map[string]int{}, map[string]bool{}
+	var stack []string
+	var members [][]string
+	var strong func(n string)
+	strong = func(n string) {
+		index[n], low[n] = len(index), len(index)
+		stack = append(stack, n)
+		onStack[n] = true
+		for _, p := range adj[n] {
+			if _, ok := index[p]; !ok {
+				strong(p)
+				low[n] = min(low[n], low[p])
+			} else if onStack[p] {
+				low[n] = min(low[n], index[p])
+			}
+		}
+		if low[n] == index[n] {
+			var c []string
+			for {
+				m := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+				onStack[m] = false
+				comp[m] = len(members)
+				c = append(c, m)
+				if m == n {
+					break
+				}
+			}
+			members = append(members, c)
+		}
+	}
+	for _, n := range nodes {
+		if _, ok := index[n]; !ok {
+			strong(n)
+		}
+	}
+	required := func(f FK) bool {
+		t := tables[f.Child]
+		if t == nil {
+			return false
+		}
+		for _, c := range f.ChildCols {
+			if !t.NotNull[strings.ToLower(c)] {
+				return false
+			}
+		}
+		return true
+	}
+	rows := func(n string) float64 {
+		if t := tables[n]; t != nil {
+			return t.Rows
+		}
+		return 0
+	}
+	// order each cycle's tables: parents of NOT NULL references first
+	pos := map[string]int{}
+	for ci, c := range members {
+		if len(c) < 2 {
+			continue
+		}
+		waits := map[string]int{} // NOT NULL parents not placed yet
+		for _, f := range fks {
+			if f.Child != f.Parent && comp[f.Child] == ci && comp[f.Parent] == ci && required(f) {
+				waits[f.Child]++
+			}
+		}
+		left := append([]string(nil), c...)
+		for len(left) > 0 {
+			sort.Slice(left, func(i, j int) bool {
+				a, b := left[i], left[j]
+				if (waits[a] == 0) != (waits[b] == 0) {
+					return waits[a] == 0
+				}
+				if rows(a) != rows(b) {
+					return rows(a) < rows(b)
+				}
+				return a < b
+			})
+			n := left[0] // when NOT NULL references cycle too, one of them gives
+			left = left[1:]
+			pos[n] = len(c) - len(left)
+			for _, f := range fks {
+				if f.Parent == n && f.Child != n && comp[f.Child] == ci && required(f) {
+					waits[f.Child]--
+				}
+			}
+		}
+	}
+	out := append([]FK(nil), fks...)
+	for i := range out {
+		f := &out[i]
+		f.Deferred = f.Child == f.Parent || comp[f.Child] == comp[f.Parent] && pos[f.Parent] > pos[f.Child]
+	}
+	return out
+}
+
+// TopoOrder returns tables parents-first within scope (FKs that close a
+// cycle are ignored, see MarkCycles).
 func TopoOrder(scope []*Table, fks []FK) []*Table {
 	in := map[string]*Table{}
 	for _, t := range scope {
@@ -347,7 +476,7 @@ func TopoOrder(scope []*Table, fks []FK) []*Table {
 	}
 	deps := map[string][]string{}
 	for _, f := range fks {
-		if in[f.Child] != nil && in[f.Parent] != nil && f.Child != f.Parent {
+		if in[f.Child] != nil && in[f.Parent] != nil && f.Child != f.Parent && !f.Deferred {
 			deps[f.Child] = append(deps[f.Child], f.Parent)
 		}
 	}
@@ -458,7 +587,7 @@ func subsetPred(d DB, t *Table, ns string, frac float64, fks []FK, tables map[st
 	q := d.Quote
 	var conds []string
 	for _, f := range fks {
-		if f.Child == t.Key && f.Parent != t.Key && inScope[f.Parent] {
+		if f.Child == t.Key && f.Parent != t.Key && !f.Deferred && inScope[f.Parent] {
 			p := tables[f.Parent]
 			var nulls, eqs []string
 			for i := range f.ChildCols {

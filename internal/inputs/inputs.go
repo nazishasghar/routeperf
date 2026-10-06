@@ -71,13 +71,17 @@ type Resolver struct {
 	cursor     map[string]string           // opID → next-page cursor
 	page       map[string]int              // opID → current page depth
 	maxPage    map[string]int
+
+	// FixtureMisses lists sql: fixtures that found no value ("op in:name" →
+	// why); those inputs fall back to sampled or generated values.
+	FixtureMisses map[string]string
 }
 
 func New(d db.DB, tables map[string]*db.Table, fixtures map[string]Fixture, kparams []string) *Resolver {
 	b := make([]byte, 3)
 	_, _ = rand.Read(b)
 	return &Resolver{DB: d, Tables: tables, Fixtures: fixtures, KParams: kparams, RunID: hex.EncodeToString(b),
-		anchors: map[string][]string{}, Unresolved: map[string][]string{}, linked: map[string]map[string][]any{},
+		anchors: map[string][]string{}, Unresolved: map[string][]string{}, FixtureMisses: map[string]string{}, linked: map[string]map[string][]any{},
 		linkBody: map[string][]any{}, cursor: map[string]string{}, page: map[string]int{}, maxPage: map[string]int{}}
 }
 
@@ -157,7 +161,7 @@ func (r *Resolver) anchorPred(t *db.Table, alias string, depth int) string {
 	if depth < 6 {
 		for _, f := range r.FKs {
 			p := r.Tables[f.Parent]
-			if f.Child != t.Key || f.Parent == t.Key || p == nil {
+			if f.Child != t.Key || f.Parent == t.Key || f.Deferred || p == nil {
 				continue
 			}
 			pa := fmt.Sprintf("p%d", depth)
@@ -181,12 +185,17 @@ func (r *Resolver) anchorPred(t *db.Table, alias string, depth int) string {
 	return r.DB.HashPred(r.DB.KeyExpr(t, alias), 0.01)
 }
 
-func (r *Resolver) fixtureValue(ctx context.Context, v any, iter int) any {
+// fixtureValue resolves a fixture value: literals as given, "sql:" values by
+// running the query and taking row iter. A query that fails or finds no
+// (non-NULL) value returns an error so the caller can fall back rather than
+// send "<nil>".
+func (r *Resolver) fixtureValue(ctx context.Context, v any, iter int) (any, error) {
 	s, ok := v.(string)
 	if !ok || !strings.HasPrefix(s, "sql:") {
-		return v
+		return v, nil
 	}
-	q := strings.TrimSpace(strings.TrimPrefix(s, "sql:"))
+	src := strings.TrimSpace(strings.TrimPrefix(s, "sql:"))
+	q := src
 	if strings.Contains(q, "{anchor}") {
 		f := strings.Fields(q)
 		col := "id"
@@ -196,10 +205,23 @@ func (r *Resolver) fixtureValue(ctx context.Context, v any, iter int) any {
 		q = strings.ReplaceAll(q, "{anchor}", r.DB.HashPred(col, 0.01))
 	}
 	vals, err := r.DB.FirstValues(ctx, q)
-	if err != nil || len(vals) == 0 {
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", src, err)
 	}
-	return vals[iter%len(vals)]
+	var found []string
+	for _, v := range vals {
+		if v != "" { // NULL
+			found = append(found, v)
+		}
+	}
+	if len(found) == 0 {
+		return nil, fmt.Errorf("%s: no rows", src)
+	}
+	return found[iter%len(found)], nil
+}
+
+func (r *Resolver) fixtureMiss(op *spec.Operation, where string, err error) {
+	r.FixtureMisses[op.ID+" "+where] = err.Error()
 }
 
 func isKName(name string, list []string) bool {
@@ -303,7 +325,11 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 				src = fx.Header
 			}
 			if v, ok := src[p.Name]; ok {
-				val, have = r.fixtureValue(ctx, v, iter), true
+				if fv, err := r.fixtureValue(ctx, v, iter); err == nil {
+					val, have = fv, true
+				} else {
+					r.fixtureMiss(op, p.In+":"+p.Name, err)
+				}
 			}
 		}
 		if ki != nil && !ki.InBody && p.Name == ki.Name && k >= 0 {
@@ -353,7 +379,7 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 		var body any
 		switch {
 		case fx.Body != nil:
-			body = r.resolveFixtureBody(ctx, deepCopy(fx.Body), iter)
+			body = r.resolveFixtureBody(ctx, op, deepCopy(fx.Body), "", iter)
 		case op.Body.Example != nil && authPath.MatchString(op.Path):
 			body = deepCopy(op.Body.Example) // credentials must stay exact
 		case op.Body.Example != nil:
@@ -389,20 +415,35 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 	return req, nil
 }
 
-func (r *Resolver) resolveFixtureBody(ctx context.Context, v any, iter int) any {
+// resolveFixtureBody resolves sql: values in a fixture body; one that finds
+// nothing falls back to an anchor ID when its key names a table (user_id),
+// and is null otherwise.
+func (r *Resolver) resolveFixtureBody(ctx context.Context, op *spec.Operation, v any, key string, iter int) any {
 	switch x := v.(type) {
 	case map[string]any:
 		for k, vv := range x {
-			x[k] = r.resolveFixtureBody(ctx, vv, iter)
+			x[k] = r.resolveFixtureBody(ctx, op, vv, k, iter)
 		}
 		return x
 	case []any:
 		for i, vv := range x {
-			x[i] = r.resolveFixtureBody(ctx, vv, iter)
+			x[i] = r.resolveFixtureBody(ctx, op, vv, key, iter)
 		}
 		return x
 	case string:
-		return r.fixtureValue(ctx, x, iter)
+		fv, err := r.fixtureValue(ctx, x, iter)
+		if err == nil {
+			return fv
+		}
+		r.fixtureMiss(op, "body:"+key, err)
+		if key != "" && idName.MatchString(key) {
+			if t := r.tableFor(key, pathFor(op)); t != nil {
+				if a := r.Anchors(ctx, t); len(a) > 0 {
+					return numOrString(a[iter%len(a)])
+				}
+			}
+		}
+		return nil
 	}
 	return v
 }
