@@ -195,14 +195,23 @@ func (r *Runner) Doctor(ctx context.Context) []Check {
 		add("Test data", "ok", fmt.Sprintf("%d tables, %.0f rows; largest %s has %.0f rows", len(r.tables), total, bigName, biggest), "")
 	}
 	declared, inferred := 0, 0
+	var cycles []string
 	for _, f := range r.fks {
 		if f.Declared {
 			declared++
 		} else {
 			inferred++
 		}
+		if f.Deferred {
+			cycles = append(cycles, f.Child+"."+strings.Join(f.ChildCols, ","))
+		}
 	}
-	add("Foreign keys", "ok", fmt.Sprintf("%d declared, %d inferred from *_id naming (used for consistent data subsets)", declared, inferred), "")
+	fkNote := fmt.Sprintf("%d declared, %d inferred from *_id naming (used for consistent data subsets)", declared, inferred)
+	if len(cycles) > 0 {
+		sort.Strings(cycles)
+		fkNote += fmt.Sprintf("; %d close a cycle and are not followed when sampling: %s", len(cycles), strings.Join(cycles, ", "))
+	}
+	add("Foreign keys", "ok", fkNote, "")
 
 	fixtures := map[string]inputs.Fixture{}
 	if b, err := os.ReadFile(c.Fixtures); err == nil {

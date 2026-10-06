@@ -129,6 +129,8 @@ SELECT c.relname, n.nspname, c.relkind::text, GREATEST(c.reltuples, 0)::float8,
             WHERE i.indrelid = c.oid AND i.indisprimary), '{}'),
   COALESCE((SELECT array_agg(a.attname ORDER BY a.attnum) FROM pg_attribute a
             WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''), '{}'),
+  COALESCE((SELECT array_agg(a.attname) FROM pg_attribute a
+            WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped AND a.attnotnull), '{}'),
   COALESCE((SELECT array_agg(DISTINCT a.attname) FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
             WHERE i.indrelid = c.oid), '{}'),
   CASE WHEN c.relkind = 'v' THEN pg_get_viewdef(c.oid, true) ELSE '' END,
@@ -142,10 +144,10 @@ WHERE c.relkind IN ('r','p','v','m') AND NOT c.relispartition
 	}
 	var all []*Table
 	for rows.Next() {
-		t := &Table{Indexed: map[string]bool{}, Indexes: map[string][]string{}}
+		t := &Table{Indexed: map[string]bool{}, Indexes: map[string][]string{}, NotNull: map[string]bool{}}
 		var kind string
-		var idx []string
-		if err := rows.Scan(&t.Name, &t.Schema, &kind, &t.Rows, &t.PKCols, &t.Cols, &idx, &t.ViewDef, &t.PartKey); err != nil {
+		var idx, notNull []string
+		if err := rows.Scan(&t.Name, &t.Schema, &kind, &t.Rows, &t.PKCols, &t.Cols, &notNull, &idx, &t.ViewDef, &t.PartKey); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -155,6 +157,9 @@ WHERE c.relkind IN ('r','p','v','m') AND NOT c.relispartition
 		}
 		for _, c := range idx {
 			t.Indexed[strings.ToLower(c)] = true
+		}
+		for _, c := range notNull {
+			t.NotNull[strings.ToLower(c)] = true
 		}
 		t.SQL = qpg(t.Schema) + "." + qpg(t.Name)
 		all = append(all, t)
@@ -297,7 +302,7 @@ WHERE c.contype = 'f' AND c.conparentid = 0 AND NOT cl.relispartition AND cn.nsp
 		f.Indexed = fkIndexed(child, f.ChildCols)
 		out = append(out, f)
 	}
-	return InferFKs(tables, out), rows.Err()
+	return MarkCycles(tables, InferFKs(tables, out)), rows.Err()
 }
 
 func (p *pg) HashPred(expr string, frac float64) string {
@@ -804,7 +809,8 @@ func (p *pg) BuildSubset(ctx context.Context, ns string, frac float64, order []*
 		_ = p.pool.QueryRow(ctx, fmt.Sprintf("SELECT count(*)::float8 FROM %s", dst)).Scan(&n)
 		counts[t.Key] = n
 	}
-	// declared FKs make cascades/RI checks cost the same as in the real schema
+	// declared FKs make cascades/RI checks cost the same as in the real schema;
+	// ones that close a cycle weren't sampled by, so existing rows aren't checked
 	rules := map[string]string{"a": "NO ACTION", "r": "RESTRICT", "c": "CASCADE", "n": "SET NULL", "d": "SET DEFAULT"}
 	for _, f := range fks {
 		if f.Declared && inScope[f.Child] && inScope[f.Parent] {
@@ -814,9 +820,13 @@ func (p *pg) BuildSubset(ctx context.Context, ns string, frac float64, order []*
 				cc = append(cc, qpg(f.ChildCols[i]))
 				pc = append(pc, qpg(f.ParentCols[i]))
 			}
-			_, err := p.pool.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.%s ADD FOREIGN KEY (%s) REFERENCES %s.%s (%s) ON DELETE %s",
-				qpg(ns), qpg(c.NSName()), strings.Join(cc, ", "), qpg(ns), qpg(pt.NSName()), strings.Join(pc, ", "), rules[f.OnDelete]))
-			if err != nil {
+			notValid := ""
+			if f.Deferred {
+				notValid = " NOT VALID"
+			}
+			_, err := p.pool.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.%s ADD FOREIGN KEY (%s) REFERENCES %s.%s (%s) ON DELETE %s%s",
+				qpg(ns), qpg(c.NSName()), strings.Join(cc, ", "), qpg(ns), qpg(pt.NSName()), strings.Join(pc, ", "), rules[f.OnDelete], notValid))
+			if err != nil && !f.Deferred { // partitioned tables take no NOT VALID FKs: go without
 				return nil, fmt.Errorf("subset fk %s.%s: %w", f.Child, f.ChildCol, err)
 			}
 		}

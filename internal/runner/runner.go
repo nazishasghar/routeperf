@@ -578,6 +578,15 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 	}
 	r.result.Ops = results
 	r.result.Unresolved = r.res.Unresolved
+	misses := make([]string, 0, len(r.res.FixtureMisses))
+	for where := range r.res.FixtureMisses {
+		misses = append(misses, where)
+	}
+	sort.Strings(misses)
+	for _, where := range misses {
+		r.result.Warnings = append(r.result.Warnings, fmt.Sprintf("%s fixture %s found no value (%s); a sampled or generated value was used instead",
+			c.Fixtures, where, r.res.FixtureMisses[where]))
+	}
 	r.result.Seconds = time.Since(r.result.Started).Seconds()
 	if !snapshot || len(r.result.Warnings) == 0 || r.result.Verified {
 		_ = os.Remove(markerPath())

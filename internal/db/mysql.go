@@ -128,7 +128,7 @@ func (m *my) Tables(ctx context.Context) (map[string]*Table, error) {
 		return nil, err
 	}
 	for rows.Next() {
-		t := &Table{Indexed: map[string]bool{}, Indexes: map[string][]string{}}
+		t := &Table{Indexed: map[string]bool{}, Indexes: map[string][]string{}, NotNull: map[string]bool{}}
 		var typ string
 		if err := rows.Scan(&t.Schema, &t.Name, &typ, &t.Rows); err != nil {
 			rows.Close()
@@ -142,18 +142,25 @@ func (m *my) Tables(ctx context.Context) (map[string]*Table, error) {
 		out[t.Key] = t
 	}
 	rows.Close()
-	cols, err := m.db.QueryContext(ctx, `SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, EXTRA FROM information_schema.COLUMNS
+	cols, err := m.db.QueryContext(ctx, `SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, EXTRA, IS_NULLABLE FROM information_schema.COLUMNS
 		WHERE TABLE_SCHEMA IN `+in+` ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`, args...)
 	if err != nil {
 		return nil, err
 	}
 	for cols.Next() {
-		var sn, tn, cn, extra string
-		if err := cols.Scan(&sn, &tn, &cn, &extra); err != nil {
+		var sn, tn, cn, extra, nullable string
+		if err := cols.Scan(&sn, &tn, &cn, &extra, &nullable); err != nil {
 			cols.Close()
 			return nil, err
 		}
-		if t := out[m.key(sn, tn)]; t != nil && !strings.Contains(strings.ToUpper(extra), "GENERATED") {
+		t := out[m.key(sn, tn)]
+		if t == nil {
+			continue
+		}
+		if nullable == "NO" {
+			t.NotNull[strings.ToLower(cn)] = true
+		}
+		if !strings.Contains(strings.ToUpper(extra), "GENERATED") {
 			t.Cols = append(t.Cols, cn)
 		}
 	}
@@ -243,7 +250,7 @@ ORDER BY kcu.CONSTRAINT_SCHEMA, kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION`, args
 		f.Indexed = fkIndexed(tables[f.Child], f.ChildCols)
 		out = append(out, *f)
 	}
-	return InferFKs(tables, out), rows.Err()
+	return MarkCycles(tables, InferFKs(tables, out)), rows.Err()
 }
 
 func (m *my) HashPred(expr string, frac float64) string {
@@ -688,6 +695,13 @@ func (m *my) BuildSubset(ctx context.Context, ns string, frac float64, order []*
 		_ = m.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+dst).Scan(&n)
 		counts[t.Key] = n
 	}
+	// FKs that close a cycle weren't sampled by: existing rows aren't checked
+	c, err := m.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	defer c.ExecContext(context.Background(), "SET FOREIGN_KEY_CHECKS = 1")
 	for _, f := range fks {
 		if f.Declared && inScope[f.Child] && inScope[f.Parent] {
 			rule := f.OnDelete
@@ -699,8 +713,15 @@ func (m *my) BuildSubset(ctx context.Context, ns string, frac float64, order []*
 				cc = append(cc, qmy(f.ChildCols[i]))
 				pc = append(pc, qmy(f.ParentCols[i]))
 			}
-			if _, err := m.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s.%s ADD FOREIGN KEY (%s) REFERENCES %s.%s (%s) ON DELETE %s",
-				qmy(ns), qmy(m.cat[f.Child].NSName()), strings.Join(cc, ", "), qmy(ns), qmy(m.cat[f.Parent].NSName()), strings.Join(pc, ", "), rule)); err != nil {
+			checks := "SET FOREIGN_KEY_CHECKS = 1"
+			if f.Deferred {
+				checks = "SET FOREIGN_KEY_CHECKS = 0"
+			}
+			if _, err := c.ExecContext(ctx, checks); err != nil {
+				return nil, err
+			}
+			if _, err := c.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s.%s ADD FOREIGN KEY (%s) REFERENCES %s.%s (%s) ON DELETE %s",
+				qmy(ns), qmy(m.cat[f.Child].NSName()), strings.Join(cc, ", "), qmy(ns), qmy(m.cat[f.Parent].NSName()), strings.Join(pc, ", "), rule)); err != nil && !f.Deferred {
 				return nil, fmt.Errorf("subset fk %s.%s: %w", f.Child, f.ChildCol, err)
 			}
 		}

@@ -350,12 +350,13 @@ createOrder:
     items: [{ sku: ABC-1, qty: 2 }]
 ```
 
-Inputs that routeperf generated without a source are listed at the end of `report.md`.
+Inputs that routeperf generated without a source are listed at the end of `report.md`. A `sql:` fixture that finds no row (or only NULL) is never sent as-is: the input falls back to the sources above and the report warns which fixture missed.
 
 ### Databases with several schemas, partitions and views
 
 - **Schemas.** Postgres tables in every schema are cataloged; a name that exists in two schemas is reported as `schema.table` (e.g. `n_archive.orders`). For MySQL, list the other databases the app reads with `db.schemas` / `--db-schemas`.
 - **Composite keys.** Primary and foreign keys with several columns keep data subsets consistent and get multi-column index advice.
+- **Circular foreign keys.** Self-references (`category.parent_id`) and tables that reference each other (`customer.primary_member_id` ⇄ `member.customer_id`) can't all be followed when sampling, so one reference per cycle is left as-is — the nullable one where there is one — and the rest keep subsets consistent. `routeperf check` lists which ones.
 - **Partitioned tables.** Subsets keep the partitioning (so the planner prunes as it does on the real table), and scans of individual partitions are reported against the parent table.
 - **Views.** Subsets recreate the views over the subset tables, so a query through a view is measured at every scale.
 
