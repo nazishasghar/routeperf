@@ -257,9 +257,10 @@ run:
   methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
   warmup: 2
   iterations: 10              # timed requests per endpoint
-  include: []                 # operationIds or tag:<name>
+  include: []                 # operationIds, tag:<name>, "METHOD /path" or path globs (/admin/**)
   exclude: []
   dangerous_ops: []           # collection DELETEs / reset-style endpoints run only if listed here
+  # as: [admin, driver]       # run every operation once per auth role (see Several user types)
 
 scale:
   data_steps: [0.01, 0.03, 0.10, 0.30, 1.0]   # data subsets for growth in n
@@ -326,6 +327,38 @@ auth:
 
 `bearer_command` works with any CLI that prints a token: `gcloud auth print-access-token`, `aws sso …`, `az account get-access-token --query accessToken -o tsv`, `vault read -field=token …`. Credential values are masked (`***`) in every report and log.
 
+#### Several user types (roles)
+
+When different endpoints need different users (admin, customer, driver…), give each user type its own credentials under `auth.roles`, and list the operations it calls in `ops`:
+
+```yaml
+auth:
+  bearer: ${CUSTOMER_TOKEN}          # default identity: operations no role claims
+
+  roles:
+    admin:                           # any auth method above works inside a role
+      login:
+        path: /auth/login
+        body: { email: admin@test.dev, password: "${ADMIN_PASSWORD}" }
+        extract: { bearer_from: $.token }
+      ops: [tag:admin, "/admin/**"]
+    driver:
+      bearer: ${DRIVER_TOKEN}
+      ops: ["/drivers/**", "GET /trips/*", listAssignedOrders]
+```
+
+- `ops` takes operationIds, `tag:<name>`, `"METHOD /path"` and path globs: `*` matches within one path segment, `**` across segments (`/admin/**` also matches `/admin`), and a method may be `*`. `"*"` alone means every operation.
+- An operation that no role's `ops` matches uses the top-level credentials. An operation that several roles match runs **once per role**. The same endpoint often runs different SQL for an admin (every row) than for a customer (their own rows), so each role gets its own line in the report: a `ROLE` column in the terminal and Markdown, and `[role]` in findings, `results.json` and `routeperf diff`.
+- Each role has its own login, cookie jar, 401 refresh and request state. IDs created by one role's `POST` are deleted by that same role, and links and cursors don't leak between roles.
+- To give one role its own inputs, key a fixture `<operationId>@<role>` (for example `getTrip@driver`). Without one, the role uses the plain `<operationId>` fixture.
+- `routeperf check` logs every role in, shows how many operations each one calls, and warns when a role's `ops` match nothing.
+
+From the command line, `--role name=TOKEN` adds or overrides a role's bearer token (repeatable), and `--as admin,driver` runs **every** selected operation once per listed role, ignoring `ops` (`default` means the top-level credentials). For example, to compare one endpoint as two users:
+
+```bash
+routeperf run --role admin="$ADMIN_TOKEN" --role driver="$DRIVER_TOKEN" --as admin,driver --only "GET /orders"
+```
+
 ### Inputs and fixtures
 
 routeperf fills in request inputs automatically, in this order:
@@ -338,7 +371,7 @@ Request bodies are sent as JSON, `application/x-www-form-urlencoded` or `multipa
 
 **Cursor pagination.** When an operation takes a cursor parameter (`cursor`, `after`, `page_token`, `starting_after`, …), the timed requests follow the cursor from each response (`next_cursor`, `meta.next_cursor`, `pageInfo.endCursor`, a `next` URL, or a `Link: rel="next"` header), so deep pages are measured too, not just page one.
 
-To control inputs yourself, add `fixtures.yaml`, keyed by `operationId`:
+To control inputs yourself, add `fixtures.yaml`, keyed by `operationId` (or `operationId@role` for one [role](#several-user-types-roles)):
 
 ```yaml
 getUserOrders:
@@ -414,7 +447,7 @@ Useful `run` flags:
 |---|---|
 | `--no-writes` | GET/HEAD only (GraphQL queries, gRPC reads) |
 | `-y`, `--yes` | don't ask before running write operations (required in non-interactive shells) |
-| `--only <ids>`, `--exclude <ids>` | operationIds or `tag:<name>` |
+| `--only <ids>`, `--exclude <ids>` | operationIds, `tag:<name>`, `"METHOD /path"` or path globs (`/admin/**`) |
 | `--no-scale` | skip the scaling experiments; plan-only Big O, faster but lower confidence |
 | `--no-per-table` | skip shrinking one table at a time |
 | `--cold`, `--cold-cmd "<cmd>"` | also measure cold-cache first hits ([Cold cache](#cold-cache)) |
@@ -428,7 +461,7 @@ Useful `run` flags:
 | `--non-interactive` | never prompt |
 | `--pg-plan-mode auto\|custom\|generic` | Postgres replay plans. `auto` (default) detects when the app's prepared statements run a generic plan and replays the same way |
 
-Global flags: `--spec --api-url --db-url --db-schemas --token --token-cmd -H -b --cookie-jar --capture --proxy-listen --protocol --pg-log-file --pg-plan-mode --mask-literals --config --allow-remote-db -v`.
+Global flags: `--spec --api-url --db-url --db-schemas --token --token-cmd -H -b --cookie-jar --role --as --capture --proxy-listen --protocol --pg-log-file --pg-plan-mode --mask-literals --config --allow-remote-db -v`.
 
 ---
 

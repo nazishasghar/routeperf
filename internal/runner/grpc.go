@@ -51,9 +51,9 @@ func (t *grpcTransport) Send(ctx context.Context, req *inputs.Request) (int, []b
 			return 400, []byte(err.Error()), nil, 0, nil
 		}
 	}
+	am := t.r.amFor(req.Role)
 	for attempt := 0; attempt < 2; attempt++ {
 		md := metadata.MD{}
-		am := t.r.am
 		if b := am.Bearer(); b != "" {
 			md.Set("authorization", "Bearer "+b)
 		}
@@ -78,7 +78,7 @@ func (t *grpcTransport) Send(ctx context.Context, req *inputs.Request) (int, []b
 		if !ok {
 			code = 500
 		}
-		if attempt == 0 && t.r.am.Refresh(ctx, code) {
+		if attempt == 0 && am.Refresh(ctx, code) {
 			continue
 		}
 		h := http.Header{}

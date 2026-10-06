@@ -33,7 +33,7 @@ import (
 type flags struct {
 	config, spec, api, dbURL, token, tokenCmd, cookieJar, out, pgLog, planMode string
 	capture, proxyListen, protocol, coldCmd, loadDur                           string
-	headers, cookies, only, exclude, dbSchemas                                 []string
+	headers, cookies, only, exclude, dbSchemas, roles, as                      []string
 	yes, noWrites, noScale, allowRemote, verbose, nonInter                     bool
 	ci, mask, cold, load, loadWrites, noHTML, noPerTable, noVerify             bool
 	iterations                                                                 int
@@ -81,6 +81,8 @@ Start with:  routeperf init   →   routeperf check   →   routeperf run`,
 	pf.StringArrayVarP(&f.headers, "header", "H", nil, "custom header 'Name: value' (repeatable)")
 	pf.StringArrayVarP(&f.cookies, "cookie", "b", nil, "cookie 'name=value' (repeatable)")
 	pf.StringVar(&f.cookieJar, "cookie-jar", "", "Netscape/curl cookie file")
+	pf.StringArrayVar(&f.roles, "role", nil, "named identity 'name=TOKEN' with its own bearer token (repeatable); it calls the operations in auth.roles.<name>.ops, or every operation with --as")
+	pf.StringSliceVar(&f.as, "as", nil, "run every selected operation once per role listed (comma-separated; 'default' = the top-level credentials)")
 	pf.StringVar(&f.pgLog, "pg-log-file", "", "Postgres stderr log path or docker:<container> (auto-detected)")
 	pf.StringVar(&f.planMode, "pg-plan-mode", "", "Postgres replay plans: auto (match the app's prepared statements) | custom | generic")
 	pf.BoolVar(&f.allowRemote, "allow-remote-db", false, "allow a non-local database (disposable test DBs only)")
@@ -243,6 +245,21 @@ func loadConfig(ask bool) (*runner.Config, error) {
 			cfg.Auth.Cookies[k] = v
 		}
 	}
+	for _, rt := range f.roles {
+		name, tok, ok := strings.Cut(rt, "=")
+		if name = strings.TrimSpace(name); !ok || name == "" {
+			return nil, fmt.Errorf("role %q must be 'name=TOKEN'", rt)
+		}
+		if cfg.Auth.Roles == nil {
+			cfg.Auth.Roles = map[string]authRole{}
+		}
+		role := cfg.Auth.Roles[name]
+		role.Bearer = tok
+		cfg.Auth.Roles[name] = role
+	}
+	if len(f.as) > 0 {
+		cfg.Run.As = f.as
+	}
 	if f.allowRemote {
 		cfg.DB.AllowRemote = true
 	}
@@ -286,8 +303,7 @@ func loadConfig(ask bool) (*runner.Config, error) {
 }
 
 func hasAuth(c *runner.Config) bool {
-	a := c.Auth
-	return a.Bearer != "" || a.BearerCommand != "" || len(a.Headers) > 0 || len(a.Cookies) > 0 || a.CookieJar != "" || len(a.Query) > 0 || a.OAuth2 != nil || a.Login != nil
+	return !c.Auth.Creds.Empty() || len(c.Auth.Roles) > 0
 }
 
 func ctxWithSignals() (context.Context, context.CancelFunc) {
@@ -407,14 +423,30 @@ func cmdDiscover(cmd *cobra.Command, _ []string) error {
 		os.Exit(1)
 	}
 	sel, skipped := r.Select()
-	fmt.Printf("\n%d operations will run:\n", len(sel))
-	for _, o := range sel {
-		fmt.Printf("  %-6s %-40s %s\n", o.Method, o.Path, o.ID)
+	distinct := map[string]bool{}
+	for _, j := range sel {
+		distinct[j.Op.ID] = true
+	}
+	if len(distinct) == len(sel) {
+		fmt.Printf("\n%d operations will run:\n", len(sel))
+	} else {
+		fmt.Printf("\n%d operations will run (%d runs across roles):\n", len(distinct), len(sel))
+	}
+	for _, j := range sel {
+		as := ""
+		if j.Role != "" {
+			as = "  as " + j.Role
+		}
+		fmt.Printf("  %-6s %-40s %s%s\n", j.Op.Method, j.Op.Path, j.Op.ID, as)
 	}
 	if len(skipped) > 0 {
 		fmt.Printf("\n%d skipped:\n", len(skipped))
 		for _, s := range skipped {
-			fmt.Printf("  %-6s %-40s %s\n", s.Method, s.Path, s.Skipped)
+			as := ""
+			if s.Role != "" {
+				as = " [" + s.Role + "]"
+			}
+			fmt.Printf("  %-6s %-40s %s\n", s.Method, s.Path+as, s.Skipped)
 		}
 	}
 	return nil
@@ -579,6 +611,7 @@ func cmdInit(cmd *cobra.Command, _ []string) error {
 	fmt.Fprintln(os.Stderr, "routeperf setup — press Enter to accept [defaults].")
 	askCore(p, cfg, true)
 	askAuth(p, cfg)
+	askRoles(p, cfg)
 	w := p.yes("Run write operations (POST/PUT/PATCH/DELETE)? Data is snapshotted and restored.", true)
 	cfg.Writes.Enabled = &w
 	if err := saveConfig(p, cfg, f.config); err != nil {
@@ -635,8 +668,35 @@ func guessServer(src string) string {
 	return "http://localhost:3000"
 }
 
-func askAuth(p *prompter, cfg *runner.Config) {
-	fmt.Fprintln(os.Stderr, "\nHow does the API authenticate? (comma-separated numbers)")
+func askAuth(p *prompter, cfg *runner.Config) { askCreds(p, &cfg.Auth.Creds, "the API") }
+
+// askRoles adds named identities (admin, driver…) that call some operations
+// with their own credentials.
+func askRoles(p *prompter, cfg *runner.Config) {
+	if !p.yes("Do other user types (admin, driver…) call some endpoints with their own credentials?", false) {
+		return
+	}
+	for {
+		name := p.ask("  Role name (empty to finish)", "")
+		if name == "" {
+			return
+		}
+		var role authRole
+		for _, x := range strings.Split(p.ask("  Operations it calls (comma-separated operationIds, tag:<name>, /admin/**; * = all)", "*"), ",") {
+			if x = strings.TrimSpace(x); x != "" {
+				role.Ops = append(role.Ops, x)
+			}
+		}
+		askCreds(p, &role.Creds, name)
+		if cfg.Auth.Roles == nil {
+			cfg.Auth.Roles = map[string]authRole{}
+		}
+		cfg.Auth.Roles[name] = role
+	}
+}
+
+func askCreds(p *prompter, cr *authCreds, who string) {
+	fmt.Fprintf(os.Stderr, "\nHow does %s authenticate? (comma-separated numbers)\n", who)
 	opts := []string{"Bearer token", "Cookies", "Custom headers (API key, tenant…)", "Login endpoint (returns token and/or cookie)", "OAuth2 client credentials", "None"}
 	for i, o := range opts {
 		fmt.Fprintf(os.Stderr, "  %d) %s\n", i+1, o)
@@ -644,21 +704,21 @@ func askAuth(p *prompter, cfg *runner.Config) {
 	for _, c := range p.choose("Choice", "6", len(opts)) {
 		switch c {
 		case 1:
-			cfg.Auth.Bearer = p.secret("Bearer token")
+			cr.Bearer = p.secret("Bearer token")
 		case 2:
 			raw := p.ask("Cookies (name=value; name2=value2) or path to a cookie-jar file", "")
 			if _, err := os.Stat(raw); err == nil {
-				cfg.Auth.CookieJar = raw
+				cr.CookieJar = raw
 			} else {
-				cfg.Auth.Cookies = map[string]string{}
+				cr.Cookies = map[string]string{}
 				for _, part := range strings.Split(raw, ";") {
 					if k, v, ok := strings.Cut(strings.TrimSpace(part), "="); ok {
-						cfg.Auth.Cookies[k] = v
+						cr.Cookies[k] = v
 					}
 				}
 			}
 		case 3:
-			cfg.Auth.Headers = map[string]string{}
+			cr.Headers = map[string]string{}
 			fmt.Fprintln(os.Stderr, "  Enter headers as 'Name: value', empty line to finish.")
 			for {
 				h := p.ask("  header", "")
@@ -666,29 +726,29 @@ func askAuth(p *prompter, cfg *runner.Config) {
 					break
 				}
 				if k, v, ok := strings.Cut(h, ":"); ok {
-					cfg.Auth.Headers[strings.TrimSpace(k)] = strings.TrimSpace(v)
+					cr.Headers[strings.TrimSpace(k)] = strings.TrimSpace(v)
 				}
 			}
 		case 4:
-			cfg.Auth.Login = &authLogin{}
-			cfg.Auth.Login.Method = strings.ToUpper(p.ask("  Login method", "POST"))
-			cfg.Auth.Login.Path = p.ask("  Login path", "/auth/login")
+			cr.Login = &authLogin{}
+			cr.Login.Method = strings.ToUpper(p.ask("  Login method", "POST"))
+			cr.Login.Path = p.ask("  Login path", "/auth/login")
 			body := p.ask(`  Login JSON body (e.g. {"email":"me@x.dev","password":"…"})`, "")
 			var m map[string]any
 			if err := json.Unmarshal([]byte(body), &m); err == nil {
-				cfg.Auth.Login.Body = m
+				cr.Login.Body = m
 			} else if body != "" {
 				fmt.Fprintln(os.Stderr, "  (not valid JSON — login body left empty)")
 			}
-			cfg.Auth.Login.Extract.Cookies = true
-			cfg.Auth.Login.Extract.BearerFrom = p.ask("  JSON path of the token in the response (empty = cookie session)", "")
-			cfg.Auth.Login.RefreshOn = []int{401}
+			cr.Login.Extract.Cookies = true
+			cr.Login.Extract.BearerFrom = p.ask("  JSON path of the token in the response (empty = cookie session)", "")
+			cr.Login.RefreshOn = []int{401}
 		case 5:
-			cfg.Auth.OAuth2 = &authOAuth{}
-			cfg.Auth.OAuth2.TokenURL = p.ask("  Token URL", "/oauth/token")
-			cfg.Auth.OAuth2.ClientID = p.ask("  Client ID", "")
-			cfg.Auth.OAuth2.ClientSecret = p.secret("  Client secret")
-			cfg.Auth.OAuth2.Scope = p.ask("  Scope", "")
+			cr.OAuth2 = &authOAuth{}
+			cr.OAuth2.TokenURL = p.ask("  Token URL", "/oauth/token")
+			cr.OAuth2.ClientID = p.ask("  Client ID", "")
+			cr.OAuth2.ClientSecret = p.secret("  Client secret")
+			cr.OAuth2.Scope = p.ask("  Scope", "")
 		}
 	}
 }
@@ -706,38 +766,50 @@ func saveConfig(p *prompter, cfg *runner.Config, path string) error {
 			exports = append(exports, fmt.Sprintf("export %s='%s'", name, strings.ReplaceAll(val, "'", `'\''`)))
 			return "${" + name + "}"
 		}
-		c.Auth.Bearer = env("RP_BEARER", c.Auth.Bearer)
-		if len(c.Auth.Headers) > 0 {
-			h := map[string]string{}
-			for k, v := range c.Auth.Headers {
-				h[k] = env("RP_HEADER_"+envName(k), v)
-			}
-			c.Auth.Headers = h
-		}
-		if len(c.Auth.Cookies) > 0 {
-			ck := map[string]string{}
-			for k, v := range c.Auth.Cookies {
-				ck[k] = env("RP_COOKIE_"+envName(k), v)
-			}
-			c.Auth.Cookies = ck
-		}
-		if c.Auth.OAuth2 != nil {
-			o := *c.Auth.OAuth2
-			o.ClientSecret = env("RP_CLIENT_SECRET", o.ClientSecret)
-			c.Auth.OAuth2 = &o
-		}
-		if c.Auth.Login != nil {
-			l := *c.Auth.Login
-			b := map[string]any{}
-			for k, v := range l.Body {
-				if strings.Contains(strings.ToLower(k), "pass") || strings.Contains(strings.ToLower(k), "secret") {
-					b[k] = env("RP_LOGIN_"+envName(k), fmt.Sprint(v))
-				} else {
-					b[k] = v
+		// maps and pointers are replaced, never edited: cfg stays usable
+		envCreds := func(cr *authCreds, prefix string) {
+			cr.Bearer = env(prefix+"BEARER", cr.Bearer)
+			if len(cr.Headers) > 0 {
+				h := map[string]string{}
+				for k, v := range cr.Headers {
+					h[k] = env(prefix+"HEADER_"+envName(k), v)
 				}
+				cr.Headers = h
 			}
-			l.Body = b
-			c.Auth.Login = &l
+			if len(cr.Cookies) > 0 {
+				ck := map[string]string{}
+				for k, v := range cr.Cookies {
+					ck[k] = env(prefix+"COOKIE_"+envName(k), v)
+				}
+				cr.Cookies = ck
+			}
+			if cr.OAuth2 != nil {
+				o := *cr.OAuth2
+				o.ClientSecret = env(prefix+"CLIENT_SECRET", o.ClientSecret)
+				cr.OAuth2 = &o
+			}
+			if cr.Login != nil {
+				l := *cr.Login
+				b := map[string]any{}
+				for k, v := range l.Body {
+					if strings.Contains(strings.ToLower(k), "pass") || strings.Contains(strings.ToLower(k), "secret") {
+						b[k] = env(prefix+"LOGIN_"+envName(k), fmt.Sprint(v))
+					} else {
+						b[k] = v
+					}
+				}
+				l.Body = b
+				cr.Login = &l
+			}
+		}
+		envCreds(&c.Auth.Creds, "RP_")
+		if len(c.Auth.Roles) > 0 {
+			roles := map[string]authRole{}
+			for n, role := range c.Auth.Roles {
+				envCreds(&role.Creds, "RP_"+envName(n)+"_")
+				roles[n] = role
+			}
+			c.Auth.Roles = roles
 		}
 		if u := c.DB.URL; strings.Contains(u, "@") && strings.Contains(u[:strings.Index(u, "@")], ":") {
 			c.DB.URL = env("RP_DB_URL", u)

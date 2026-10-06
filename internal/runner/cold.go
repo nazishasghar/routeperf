@@ -102,7 +102,7 @@ func (r *Runner) coldPhase(ctx context.Context, results []*analyze.OpResult) {
 				r.result.Warnings = append(r.result.Warnings, "cold sample failed: "+err.Error())
 				return
 			}
-			req, err := r.res.Build(ctx, o, 70000+i, -1, nil, nil)
+			req, err := r.resFor(res.Role).Build(ctx, o, 70000+i, -1, nil, nil)
 			if err != nil {
 				break
 			}

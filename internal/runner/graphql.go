@@ -26,7 +26,7 @@ func (t *gqlTransport) Send(ctx context.Context, req *inputs.Request) (int, []by
 	if op == nil {
 		return t.r.sendHTTP(ctx, req)
 	}
-	hreq := &inputs.Request{Method: "POST", Path: t.path, Query: url.Values{}, Header: req.Header, ContentType: "application/json",
+	hreq := &inputs.Request{Method: "POST", Path: t.path, Query: url.Values{}, Header: req.Header, ContentType: "application/json", Role: req.Role,
 		Body: map[string]any{"query": op.Document, "variables": req.Vars, "operationName": op.Name}}
 	status, body, hdr, ms, err := t.r.sendHTTP(ctx, hreq)
 	if err != nil || status != 200 {
@@ -81,7 +81,7 @@ func (r *Runner) loadGraphQL(ctx context.Context, add addFn) bool {
 		if strings.HasSuffix(strings.TrimRight(src, "/"), "graphql") {
 			ep = src
 		}
-		hreq := &inputs.Request{Method: "POST", Path: path, Query: url.Values{}, Header: map[string]string{}, ContentType: "application/json",
+		hreq := &inputs.Request{Method: "POST", Path: path, Query: url.Values{}, Header: map[string]string{}, ContentType: "application/json", Role: r.specRole(),
 			Body: map[string]any{"query": gql.IntrospectionQuery}}
 		var status int
 		var body []byte

@@ -114,6 +114,7 @@ type OpResult struct {
 	Method     string             `json:"method"`
 	Path       string             `json:"path"`
 	Phase      string             `json:"phase"`
+	Role       string             `json:"role,omitempty"` // auth role it ran as ("" = default credentials)
 	Skipped    string             `json:"skipped,omitempty"`
 	KParam     string             `json:"k_param,omitempty"`
 	Samples    []Sample           `json:"-"`
@@ -148,6 +149,14 @@ type OpResult struct {
 	Pages      int                `json:"cursor_pages,omitempty"` // pages walked through a cursor
 	Load       []LoadStep         `json:"load,omitempty"`
 	LoadNote   string             `json:"load_verdict,omitempty"`
+}
+
+// Endpoint is "METHOD /path", followed by " [role]" when it ran as a named role.
+func (o *OpResult) Endpoint() string {
+	if o.Role == "" {
+		return o.Method + " " + o.Path
+	}
+	return o.Method + " " + o.Path + " [" + o.Role + "]"
 }
 
 // LoadStep is one concurrency level of a load run.

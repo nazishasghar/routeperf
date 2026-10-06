@@ -281,6 +281,68 @@ func (s *Spec) ByID(id string) *Operation {
 	return nil
 }
 
+// Match reports whether pattern selects o: "*" (every operation), an
+// operationId, "tag:<name>", "METHOD /path", or a path glob with an optional
+// method ("/admin/**", "GET /users/*", "* /orders/**"). In globs * stays
+// within one path segment and ** spans segments; a trailing /** also matches
+// the bare prefix.
+func Match(pattern string, o *Operation) bool {
+	p := strings.TrimSpace(pattern)
+	switch {
+	case p == "*":
+		return true
+	case strings.HasPrefix(p, "tag:"):
+		for _, t := range o.Tags {
+			if strings.EqualFold(t, p[4:]) {
+				return true
+			}
+		}
+		return false
+	case strings.EqualFold(p, o.ID), strings.EqualFold(p, o.Method+" "+o.Path):
+		return true
+	}
+	method, path := "*", p
+	if m, rest, ok := strings.Cut(p, " "); ok {
+		method, path = m, strings.TrimSpace(rest)
+	}
+	if !strings.HasPrefix(path, "/") || method != "*" && !strings.EqualFold(method, o.Method) {
+		return false
+	}
+	return globRe(path).MatchString(o.Path)
+}
+
+// MatchAny reports whether any pattern selects o.
+func MatchAny(patterns []string, o *Operation) bool {
+	for _, p := range patterns {
+		if Match(p, o) {
+			return true
+		}
+	}
+	return false
+}
+
+func globRe(g string) *regexp.Regexp {
+	tail := ""
+	if strings.HasSuffix(g, "/**") {
+		g, tail = strings.TrimSuffix(g, "/**"), "(/.*)?"
+	}
+	var b strings.Builder
+	b.WriteString("^")
+	for i := 0; i < len(g); i++ {
+		switch {
+		case strings.HasPrefix(g[i:], "**"):
+			b.WriteString(".*")
+			i++
+		case g[i] == '*':
+			b.WriteString("[^/]*")
+		default:
+			b.WriteString(regexp.QuoteMeta(g[i : i+1]))
+		}
+	}
+	b.WriteString(tail + "$")
+	return regexp.MustCompile(b.String())
+}
+
 // OrderWrites returns write ops in lifecycle order: POST (parents first),
 // then PUT/PATCH, then DELETE (children first).
 func OrderWrites(ops []*Operation) []*Operation {

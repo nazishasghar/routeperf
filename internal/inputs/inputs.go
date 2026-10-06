@@ -38,6 +38,7 @@ type Request struct {
 	Op          *spec.Operation
 	Page        int            // cursor page index (0 = first page)
 	Vars        map[string]any // GraphQL variables
+	Role        string         // identity that sends it ("" = default credentials)
 }
 
 type KInfo struct {
@@ -62,6 +63,7 @@ type Resolver struct {
 	Fixtures   map[string]Fixture
 	KParams    []string
 	RunID      string
+	Role       string // requests are sent as this role; fixtures keyed "<operationId>@<role>" win
 	anchors    map[string][]string
 	Unresolved map[string][]string // opID → params generated without a source
 	FKs        []db.FK
@@ -286,8 +288,11 @@ func sortedProps(s *openapi3.Schema) []string {
 // Build creates the request for iteration iter. k < 0 means "default size".
 // overrides force path param values (ID chaining for write lifecycles).
 func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, ki *KInfo, overrides map[string]string) (*Request, error) {
-	fx := r.Fixtures[op.ID]
-	req := &Request{Method: op.Method, Path: op.Path, Query: url.Values{}, Header: map[string]string{}, PathParams: map[string]string{}, Op: op, Vars: map[string]any{}}
+	fx, ok := r.Fixtures[op.ID+"@"+r.Role]
+	if !ok || r.Role == "" {
+		fx = r.Fixtures[op.ID]
+	}
+	req := &Request{Method: op.Method, Path: op.Path, Query: url.Values{}, Header: map[string]string{}, PathParams: map[string]string{}, Op: op, Vars: map[string]any{}, Role: r.Role}
 	opPath := pathFor(op)
 	if op.Body != nil {
 		req.ContentType = op.Body.ContentType

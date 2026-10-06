@@ -12,31 +12,26 @@ import (
 
 	"github.com/nazishasghar/routeperf/internal/analyze"
 	"github.com/nazishasghar/routeperf/internal/inputs"
-	"github.com/nazishasghar/routeperf/internal/spec"
 )
 
 // loadPhase drives each endpoint with concurrent clients at increasing
 // concurrency, sampling DB activity, to expose lock contention and pool
 // limits that serial runs can't see.
-func (r *Runner) loadPhase(ctx context.Context, results []*analyze.OpResult, ops []*spec.Operation) {
+func (r *Runner) loadPhase(ctx context.Context, results []*analyze.OpResult) {
 	c := r.cfg
-	byID := map[string]*analyze.OpResult{}
 	for _, res := range results {
-		byID[res.ID] = res
-	}
-	for _, o := range ops {
-		res := byID[o.ID]
-		if res == nil || res.Skipped != "" || ctx.Err() != nil {
+		o := r.sp.ByID(res.ID)
+		if o == nil || res.Skipped != "" || ctx.Err() != nil {
 			continue
 		}
 		if o.Phase == "W" && (!c.Load.Writes || o.Method == "DELETE") {
 			continue
 		}
-		pool := r.prebuild(ctx, o, 200)
+		pool := r.prebuild(ctx, Job{Op: o, Role: res.Role}, 200)
 		if len(pool) == 0 {
 			continue
 		}
-		r.log("  load %-6s %-40s concurrency %v × %s", o.Method, o.Path, c.Load.Concurrency, c.loadDuration())
+		r.log("  load %-47s concurrency %v × %s", res.Endpoint(), c.Load.Concurrency, c.loadDuration())
 		for _, conc := range c.Load.Concurrency {
 			if ctx.Err() != nil {
 				break
@@ -49,10 +44,10 @@ func (r *Runner) loadPhase(ctx context.Context, results []*analyze.OpResult, ops
 
 // prebuild creates request inputs up front: the resolver isn't safe for
 // concurrent use.
-func (r *Runner) prebuild(ctx context.Context, o *spec.Operation, n int) []*inputs.Request {
+func (r *Runner) prebuild(ctx context.Context, j Job, n int) []*inputs.Request {
 	var out []*inputs.Request
 	for i := 0; i < n; i++ {
-		req, err := r.res.Build(ctx, o, 100000+i, -1, nil, nil)
+		req, err := r.resFor(j.Role).Build(ctx, j.Op, 100000+i, -1, nil, nil)
 		if err != nil {
 			break
 		}

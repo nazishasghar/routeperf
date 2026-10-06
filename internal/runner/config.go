@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -47,6 +48,7 @@ type Config struct {
 		Include      []string `yaml:"include"`
 		Exclude      []string `yaml:"exclude"`
 		DangerousOps []string `yaml:"dangerous_ops"`
+		As           []string `yaml:"as,omitempty"` // run every operation as these roles ("default" = top-level auth) instead of auth.roles.*.ops
 	} `yaml:"run"`
 	Scale struct {
 		Disabled   bool      `yaml:"disabled"`
@@ -97,6 +99,16 @@ func (c *Config) Verify() bool     { return c.Advice.Verify == nil || *c.Advice.
 func (c *Config) TraceOn() bool    { return c.Capture.Traceparent == nil || *c.Capture.Traceparent }
 func (c *Config) HTMLReport() bool { return c.Report.HTML == nil || *c.Report.HTML }
 func (c *Config) Proxy() bool      { return c.Capture.Mode == "proxy" }
+
+// RoleNames returns the configured auth roles, sorted.
+func (c *Config) RoleNames() []string {
+	names := make([]string, 0, len(c.Auth.Roles))
+	for n := range c.Auth.Roles {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
 
 func (c *Config) loadDuration() time.Duration {
 	d, err := time.ParseDuration(c.Load.Duration)
@@ -273,6 +285,14 @@ auth:                           # any combination
   #   body: { email: perf@test.dev, password: "${PERF_PASSWORD}" }
   #   extract: { cookies: true, bearer_from: "$.data.accessToken" }
   #   refresh_on: [401]
+  # roles:                      # other user types, each with its own credentials (same keys as above)
+  #   admin:
+  #     login: { path: /auth/login, body: { email: admin@test.dev, password: "${ADMIN_PASSWORD}" }, extract: { bearer_from: "$.token" } }
+  #     ops: [tag:admin, "/admin/**"]   # operationIds, tag:<name>, "METHOD /path" or path globs; "*" = every operation
+  #   driver:
+  #     bearer: ${DRIVER_TOKEN}
+  #     ops: ["/drivers/**", "GET /trips/*"]
+  # operations no role's ops match use the credentials above; one matched by several roles runs once per role
 
 capture:
   mode: log                     # log: server statement log (needs admin) | proxy: wire proxy, point the app at proxy_listen
@@ -290,6 +310,7 @@ run:
   include: []                   # operationIds or tag:<name>
   exclude: []
   dangerous_ops: []             # collection deletes / reset endpoints must be listed to run
+  # as: [admin, driver]         # run every operation once per role, ignoring roles' ops (default = top-level auth)
 
 scale:
   data_steps: [0.01, 0.03, 0.10, 0.30, 1.0]

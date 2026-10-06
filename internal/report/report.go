@@ -63,6 +63,26 @@ func hasCold(res *runner.Result) bool {
 	return false
 }
 
+// hasRoles reports whether any operation ran as a named auth role.
+func hasRoles(res *runner.Result) bool {
+	for _, list := range [][]*analyze.OpResult{res.Ops, res.Skipped} {
+		for _, o := range list {
+			if o.Role != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// roleName is the identity an operation ran as.
+func roleName(o *analyze.OpResult) string {
+	if o.Role == "" {
+		return "default"
+	}
+	return o.Role
+}
+
 func Terminal(w io.Writer, res *runner.Result) {
 	fmt.Fprintf(w, "\n%s  %s · %s %s · %.0fs", c("1", "routeperf"), res.SpecTitle, res.Dialect, res.DBVersion, res.Seconds)
 	if res.DBTime != "" {
@@ -75,8 +95,17 @@ func Terminal(w io.Writer, res *runner.Result) {
 		coldHdr = fmt.Sprintf(" %8s", "COLD")
 	}
 	fmt.Fprintf(w, "%s\n", c("90", "latency is warm-cache"+map[bool]string{true: "; COLD = first hit after cache eviction (" + res.ColdMethod + ")", false: ""}[cold]))
-	fmt.Fprintf(w, "%-7s %-34s %8s %8s%s %8s %-8s %10s %-40s %-6s %s\n", "METHOD", "ROUTE", "P50", "P95", coldHdr, "DB", "Q/REQ", "ROWS/REQ", "BIG O", "CONF", "STATUS")
+	roles := hasRoles(res)
+	roleHdr := ""
+	if roles {
+		roleHdr = fmt.Sprintf(" %-10s", "ROLE")
+	}
+	fmt.Fprintf(w, "%-7s %-34s%s %8s %8s%s %8s %-8s %10s %-40s %-6s %s\n", "METHOD", "ROUTE", roleHdr, "P50", "P95", coldHdr, "DB", "Q/REQ", "ROWS/REQ", "BIG O", "CONF", "STATUS")
 	for _, o := range res.Ops {
+		roleCol := ""
+		if roles {
+			roleCol = fmt.Sprintf(" %-10s", trunc(roleName(o), 10))
+		}
 		reason := ""
 		if len(o.Reasons) > 0 {
 			reason = " " + c("90", trunc(o.Reasons[0], 48))
@@ -89,13 +118,17 @@ func Terminal(w io.Writer, res *runner.Result) {
 				coldCol = fmt.Sprintf(" %8s", "—")
 			}
 		}
-		fmt.Fprintf(w, "%-7s %-34s %6.1fms %6.1fms%s %6.2fms %-8s %10s %-40s %-6s %s%s\n", o.Method, trunc(o.Path, 34), o.Latency.P50, o.Latency.P95, coldCol, o.DBMs,
+		fmt.Fprintf(w, "%-7s %-34s%s %6.1fms %6.1fms%s %6.2fms %-8s %10s %-40s %-6s %s%s\n", o.Method, trunc(o.Path, 34), roleCol, o.Latency.P50, o.Latency.P95, coldCol, o.DBMs,
 			trunc(o.QModel, 8), human(o.RowsPerReq), trunc(o.BigO, 40), o.Confidence, statusColor(o.Status), reason)
 	}
 	if len(res.Skipped) > 0 {
 		fmt.Fprintf(w, "\n%s\n", c("90", fmt.Sprintf("skipped %d operation(s):", len(res.Skipped))))
 		for _, s := range res.Skipped {
-			fmt.Fprintf(w, "  %s %s %s\n", c("90", s.Method), s.Path, c("90", "— "+s.Skipped))
+			role := ""
+			if s.Role != "" {
+				role = " [" + s.Role + "]"
+			}
+			fmt.Fprintf(w, "  %s %s%s %s\n", c("90", s.Method), s.Path, role, c("90", "— "+s.Skipped))
 		}
 	}
 	var findings []string
@@ -107,7 +140,7 @@ func Terminal(w io.Writer, res *runner.Result) {
 			if i >= 3 {
 				break
 			}
-			line := fmt.Sprintf("  %s %s %s — %s", statusColor(o.Status), o.Method, o.Path, a.Message)
+			line := fmt.Sprintf("  %s %s — %s", statusColor(o.Status), o.Endpoint(), a.Message)
 			if a.SQL != "" {
 				line += "\n      " + c("36", a.SQL)
 			}
@@ -126,7 +159,7 @@ func Terminal(w io.Writer, res *runner.Result) {
 			continue
 		}
 		last := o.Load[len(o.Load)-1]
-		load = append(load, fmt.Sprintf("  %-6s %-34s %5.0f req/s at c=%-3d p95 %6.1fms  %s", o.Method, trunc(o.Path, 34), last.RPS, last.Concurrency, last.P95, c("90", o.LoadNote)))
+		load = append(load, fmt.Sprintf("  %-41s %5.0f req/s at c=%-3d p95 %6.1fms  %s", trunc(o.Endpoint(), 41), last.RPS, last.Concurrency, last.P95, c("90", o.LoadNote)))
 	}
 	if len(load) > 0 {
 		fmt.Fprintf(w, "\n%s\n%s\n", c("1", "Under load"), strings.Join(load, "\n"))
@@ -212,11 +245,19 @@ func WriteMarkdown(path string, res *runner.Result) error {
 		fmt.Fprintf(&b, "- %s\n", l)
 	}
 	cold := hasCold(res)
-	b.WriteString("\n## Endpoints\n\n| Status | Method | Endpoint | p50 | p95 | p99 |")
+	roles := hasRoles(res)
+	b.WriteString("\n## Endpoints\n\n| Status | Method | Endpoint |")
+	if roles {
+		b.WriteString(" Role |")
+	}
+	b.WriteString(" p50 | p95 | p99 |")
 	if cold {
 		b.WriteString(" cold p50 |")
 	}
 	b.WriteString(" DB time/req | Queries/req | Rows examined/req | Big O | Confidence | Projected p50 @10× data |\n|---|---|---|---|---|---|")
+	if roles {
+		b.WriteString("---|")
+	}
 	if cold {
 		b.WriteString("---|")
 	}
@@ -226,7 +267,11 @@ func WriteMarkdown(path string, res *runner.Result) error {
 		if v, ok := o.Projection["10x"]; ok {
 			proj = fmt.Sprintf("%.0f ms", v)
 		}
-		fmt.Fprintf(&b, "| %s | %s | `%s` | %.1f ms | %.1f ms | %.1f ms |", o.Status, o.Method, o.Path, o.Latency.P50, o.Latency.P95, o.Latency.P99)
+		fmt.Fprintf(&b, "| %s | %s | `%s` |", o.Status, o.Method, o.Path)
+		if roles {
+			fmt.Fprintf(&b, " %s |", roleName(o))
+		}
+		fmt.Fprintf(&b, " %.1f ms | %.1f ms | %.1f ms |", o.Latency.P50, o.Latency.P95, o.Latency.P99)
 		if cold {
 			if o.Cold != nil {
 				fmt.Fprintf(&b, " %.1f ms |", o.Cold.P50)
@@ -239,12 +284,12 @@ func WriteMarkdown(path string, res *runner.Result) error {
 	if len(res.Skipped) > 0 {
 		b.WriteString("\n### Skipped\n\n")
 		for _, s := range res.Skipped {
-			fmt.Fprintf(&b, "- `%s %s` — %s\n", s.Method, s.Path, s.Skipped)
+			fmt.Fprintf(&b, "- `%s` — %s\n", s.Endpoint(), s.Skipped)
 		}
 	}
 	b.WriteString("\n## Route details\n")
 	for _, o := range res.Ops {
-		fmt.Fprintf(&b, "\n### %s `%s %s`\n\n", o.Status, o.Method, o.Path)
+		fmt.Fprintf(&b, "\n### %s `%s`\n\n", o.Status, o.Endpoint())
 		fmt.Fprintf(&b, "- **Big O:** `%s` (confidence %s)", o.BigO, o.Confidence)
 		if o.Dominant != "" {
 			fmt.Fprintf(&b, ", dominant table `%s`", o.Dominant)

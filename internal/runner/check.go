@@ -80,9 +80,16 @@ func (r *Runner) Doctor(ctx context.Context) []Check {
 		add("API URL", "fail", fmt.Sprintf("invalid API URL %q", c.API.BaseURL), "use a full URL like http://localhost:3000")
 		return out
 	}
-	if r.am, err = auth.New(c.Auth, c.API.BaseURL, c.timeout()); err != nil {
+	if r.am, err = auth.New(c.Auth.Creds, c.API.BaseURL, c.timeout()); err != nil {
 		add("Auth config", "fail", err.Error(), "check cookie_jar path / auth settings")
 		return out
+	}
+	r.roleAM = map[string]*auth.Manager{}
+	for _, n := range c.RoleNames() {
+		if r.roleAM[n], err = auth.New(c.Auth.Roles[n].Creds, c.API.BaseURL, c.timeout()); err != nil {
+			add("Auth config", "fail", "role "+n+": "+err.Error(), "check auth.roles."+n+" settings")
+			return out
+		}
 	}
 	apiUp := true
 	if conn, err := net.DialTimeout("tcp", hostPort(r.baseURL), 3*time.Second); err != nil {
@@ -92,14 +99,21 @@ func (r *Runner) Doctor(ctx context.Context) []Check {
 		conn.Close()
 		add("API reachable", "ok", "TCP connect to "+hostPort(r.baseURL)+" succeeded", "")
 	}
-	if c.Auth.OAuth2 != nil || c.Auth.Login != nil || c.Auth.BearerCommand != "" {
-		if !apiUp && c.Auth.Login != nil {
-			add("Auth flow", "skip", "API not reachable", "")
-		} else if err := r.am.Init(ctx); err != nil {
-			add("Auth flow", "fail", err.Error(), "check login path/body or OAuth2 token_url/client credentials")
-		} else {
-			add("Auth flow", "ok", authFlowName(c.Auth)+" succeeded; token/cookies acquired", "")
+	flow := func(name string, cr auth.Creds, am *auth.Manager) {
+		if !cr.Dynamic() {
+			return
 		}
+		if !apiUp && cr.Login != nil {
+			add(name, "skip", "API not reachable", "")
+		} else if err := am.Init(ctx); err != nil {
+			add(name, "fail", err.Error(), "check login path/body or OAuth2 token_url/client credentials")
+		} else {
+			add(name, "ok", authFlowName(cr)+" succeeded; token/cookies acquired", "")
+		}
+	}
+	flow("Auth flow", c.Auth.Creds, r.am)
+	for _, n := range c.RoleNames() {
+		flow("Auth flow ("+n+")", c.Auth.Roles[n].Creds, r.roleAM[n])
 	}
 
 	// --- spec
@@ -107,12 +121,26 @@ func (r *Runner) Doctor(ctx context.Context) []Check {
 		return out
 	}
 
-	// --- security scheme coverage
+	// --- roles
+	if len(c.Auth.Roles) > 0 || len(c.Run.As) > 0 {
+		add(r.rolesCheck())
+	}
+
+	// --- security scheme coverage (a scheme counts when any identity has it)
 	if len(r.sp.Schemes) > 0 {
+		ams := []*auth.Manager{r.am}
+		for _, n := range c.RoleNames() {
+			ams = append(ams, r.roleAM[n])
+		}
 		var parts []string
 		allOK := true
 		for name := range r.sp.Schemes {
-			ok, _ := r.am.Satisfies(openapi3.SecurityRequirements{openapi3.SecurityRequirement{name: {}}}, r.sp.Schemes)
+			ok := false
+			for _, am := range ams {
+				if sat, _ := am.Satisfies(openapi3.SecurityRequirements{openapi3.SecurityRequirement{name: {}}}, r.sp.Schemes); sat {
+					ok = true
+				}
+			}
 			mark := "✓"
 			if !ok {
 				mark = "✗"
@@ -120,23 +148,26 @@ func (r *Runner) Doctor(ctx context.Context) []Check {
 			}
 			parts = append(parts, name+" "+mark)
 		}
-		st, fix := "ok", ""
-		if !allOK {
-			unsat := 0
-			for _, o := range r.sp.Ops {
-				reqs := r.sp.Global
-				if o.Security != nil {
-					reqs = *o.Security
-				}
-				if ok, _ := r.am.Satisfies(reqs, r.sp.Schemes); !ok {
+		unsat := 0
+		for _, o := range r.sp.Ops {
+			reqs := r.sp.Global
+			if o.Security != nil {
+				reqs = *o.Security
+			}
+			for _, role := range r.rolesFor(o) {
+				if ok, _ := r.amFor(role).Satisfies(reqs, r.sp.Schemes); !ok {
 					unsat++
 				}
 			}
-			if unsat > 0 {
-				st, fix = "warn", fmt.Sprintf("%d operation(s) need a ✗ scheme and will be skipped; add --token / -H / -b or auth.login", unsat)
-			} else {
-				parts[len(parts)-1] += " — every operation has a satisfied alternative"
-			}
+		}
+		st, fix := "ok", ""
+		switch {
+		case unsat > 0 && len(c.Auth.Roles) > 0:
+			st, fix = "warn", fmt.Sprintf("%d operation run(s) lack credentials for their scheme and will be skipped; give that identity credentials, or add the operations to an auth.roles.<name>.ops list", unsat)
+		case unsat > 0:
+			st, fix = "warn", fmt.Sprintf("%d operation(s) need a ✗ scheme and will be skipped; add --token / -H / -b or auth.login", unsat)
+		case !allOK:
+			parts[len(parts)-1] += " — every operation has a satisfied alternative"
 		}
 		add("Auth coverage", st, strings.Join(parts, ", "), fix)
 	}
@@ -223,6 +254,12 @@ func (r *Runner) Doctor(ctx context.Context) []Check {
 	}
 	r.res = inputs.New(r.db, r.tables, fixtures, c.Scale.KParams)
 	r.res.FKs, r.res.Spec = r.fks, r.sp
+	r.roleRes = map[string]*inputs.Resolver{}
+	for _, n := range c.RoleNames() {
+		rs := inputs.New(r.db, r.tables, fixtures, c.Scale.KParams)
+		rs.FKs, rs.Spec, rs.Role = r.fks, r.sp, n
+		r.roleRes[n] = rs
+	}
 	r.result = &Result{Tool: "routeperf", Version: version.String(), Started: time.Now(), Spec: c.Spec, SpecTitle: r.sp.Title, Protocol: r.protocol(), API: c.API.BaseURL,
 		Dialect: info.Dialect, DBVersion: info.Version, Database: info.Database, Tables: map[string]float64{}, Snapshot: "none"}
 	for n, t := range r.tables {
@@ -278,7 +315,14 @@ func (r *Runner) Doctor(ctx context.Context) []Check {
 	} else if len(skipped) > 0 {
 		st = "warn"
 	}
-	detail := fmt.Sprintf("%d of %d operations will run", len(sel), len(r.sp.Ops))
+	distinct := map[*spec.Operation]bool{}
+	for _, j := range sel {
+		distinct[j.Op] = true
+	}
+	detail := fmt.Sprintf("%d of %d operations will run", len(distinct), len(r.sp.Ops))
+	if len(sel) != len(distinct) {
+		detail += fmt.Sprintf(" (%d runs across roles)", len(sel))
+	}
 	if len(rs) > 0 {
 		detail += "; skipped: " + strings.Join(rs, ", ")
 	}
@@ -287,7 +331,81 @@ func (r *Runner) Doctor(ctx context.Context) []Check {
 		add("Writes", "ok", fmt.Sprintf("enabled; snapshot strategy %q (data restored after the run)", c.Writes.Snapshot), "")
 	}
 	r.result.secrets = r.am.Secrets()
+	for _, n := range c.RoleNames() {
+		r.result.secrets = append(r.result.secrets, r.roleAM[n].Secrets()...)
+	}
 	return out
+}
+
+// rolesCheck validates auth.roles and run.as and says how many operations
+// each identity calls.
+func (r *Runner) rolesCheck() (string, string, string, string) {
+	c := r.cfg
+	if _, ok := c.Auth.Roles["default"]; ok {
+		return "Auth roles", "fail", `role name "default" is reserved for the top-level auth credentials`, "rename auth.roles.default"
+	}
+	for _, n := range c.Run.As {
+		if _, ok := c.Auth.Roles[n]; !ok && n != "default" {
+			return "Auth roles", "fail", fmt.Sprintf("run.as %q: no such role", n), "define it under auth.roles, or pass --role " + n + "=TOKEN"
+		}
+	}
+	count := map[string]int{}
+	for _, o := range r.sp.Ops {
+		for _, role := range r.rolesFor(o) {
+			count[role]++
+		}
+	}
+	ops := func(n int) string {
+		if n == 1 {
+			return "1 op"
+		}
+		return fmt.Sprintf("%d ops", n)
+	}
+	var parts, idle []string
+	for _, n := range c.RoleNames() {
+		parts = append(parts, fmt.Sprintf("%s: %s (%s)", n, ops(count[n]), credKind(c.Auth.Roles[n].Creds)))
+		if count[n] == 0 {
+			idle = append(idle, n)
+		}
+	}
+	if count[""] > 0 {
+		parts = append(parts, fmt.Sprintf("default: %s (%s)", ops(count[""]), credKind(c.Auth.Creds)))
+	}
+	if len(idle) > 0 && len(c.Run.As) == 0 {
+		return "Auth roles", "warn", strings.Join(parts, "; "), "no operation matches the ops patterns of " + strings.Join(idle, ", ") +
+			" (use operationIds, tag:<name>, \"METHOD /path\" or globs like /admin/**)"
+	}
+	return "Auth roles", "ok", strings.Join(parts, "; "), ""
+}
+
+// credKind names the credentials an identity sends.
+func credKind(a auth.Creds) string {
+	var k []string
+	if a.Login != nil {
+		k = append(k, "login "+a.Login.Path)
+	}
+	if a.OAuth2 != nil {
+		k = append(k, "OAuth2")
+	}
+	if a.BearerCommand != "" {
+		k = append(k, "bearer_command")
+	}
+	if a.Bearer != "" {
+		k = append(k, "bearer")
+	}
+	if len(a.Headers) > 0 {
+		k = append(k, "headers")
+	}
+	if len(a.Cookies) > 0 || a.CookieJar != "" {
+		k = append(k, "cookies")
+	}
+	if len(a.Query) > 0 {
+		k = append(k, "query key")
+	}
+	if len(k) == 0 {
+		return "no credentials"
+	}
+	return strings.Join(k, " + ")
 }
 
 func (r *Runner) needsAuth(o *spec.Operation) bool {
@@ -309,19 +427,24 @@ func (r *Runner) appUsesDB(ctx context.Context) (string, string, string, string)
 	tried, statements := 0, 0
 	var codes []string
 	authFail, authTried := 0, 0
-	sort.SliceStable(sel, func(i, j int) bool { return r.needsAuth(sel[i]) && !r.needsAuth(sel[j]) })
-	for _, o := range sel {
+	sort.SliceStable(sel, func(i, j int) bool { return r.needsAuth(sel[i].Op) && !r.needsAuth(sel[j].Op) })
+	for _, j := range sel {
+		o := j.Op
 		if o.Phase != "R" || tried >= 4 {
 			continue
 		}
-		req, err := r.res.Build(ctx, o, 0, -1, nil, nil)
+		req, err := r.resFor(j.Role).Build(ctx, o, 0, -1, nil, nil)
 		if err != nil {
 			continue
 		}
 		tried++
 		s, _, _ := r.request(ctx, req, 0)
 		statements += s.NStmts
-		codes = append(codes, fmt.Sprintf("%s %d", o.Path, s.Status))
+		label := o.Path
+		if j.Role != "" {
+			label += " [" + j.Role + "]"
+		}
+		codes = append(codes, fmt.Sprintf("%s %d", label, s.Status))
 		if r.needsAuth(o) {
 			authTried++
 			if s.Status == http.StatusUnauthorized || s.Status == http.StatusForbidden {
@@ -354,11 +477,14 @@ func hostPort(u *url.URL) string {
 	return u.Hostname() + ":80"
 }
 
-func authFlowName(a auth.Config) string {
-	if a.Login != nil {
+func authFlowName(a auth.Creds) string {
+	switch {
+	case a.Login != nil:
 		return "login " + a.Login.Path
+	case a.OAuth2 != nil:
+		return "OAuth2 client credentials"
 	}
-	return "OAuth2 client credentials"
+	return "bearer_command"
 }
 
 func dbFix(raw string, err error) string {

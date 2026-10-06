@@ -349,9 +349,15 @@ func WriteHTML(path string, res *runner.Result) error {
 	}
 	b.WriteString(`<th data-k="n" class="num">DB ms/req</th><th data-k="t">Queries/req</th><th data-k="n" class="num">Rows exam./req</th><th data-k="t">Big O</th><th data-k="t">Conf.</th></tr></thead><tbody>`)
 	rank := map[string]int{"FAIL": 0, "WARN": 1, "OK": 2}
+	roleTag := func(o *analyze.OpResult) string {
+		if o.Role == "" {
+			return ""
+		}
+		return ` <span class="muted">as ` + esc(o.Role) + `</span>`
+	}
 	for i, o := range res.Ops {
-		fmt.Fprintf(&b, `<tr data-status="%s"><td data-v="%d">%s</td><td data-v="%s"><a href="#op%d"><b>%s</b> %s</a></td><td class="num" data-v="%f">%.1f</td><td class="num" data-v="%f">%.1f</td>`,
-			esc(o.Status), rank[o.Status], statusChip(o.Status), esc(o.Path), i, esc(o.Method), esc(o.Path), o.Latency.P50, o.Latency.P50, o.Latency.P95, o.Latency.P95)
+		fmt.Fprintf(&b, `<tr data-status="%s"><td data-v="%d">%s</td><td data-v="%s"><a href="#op%d"><b>%s</b> %s%s</a></td><td class="num" data-v="%f">%.1f</td><td class="num" data-v="%f">%.1f</td>`,
+			esc(o.Status), rank[o.Status], statusChip(o.Status), esc(strings.TrimSpace(o.Path+" "+o.Role)), i, esc(o.Method), esc(o.Path), roleTag(o), o.Latency.P50, o.Latency.P50, o.Latency.P95, o.Latency.P95)
 		if cold {
 			if o.Cold != nil {
 				fmt.Fprintf(&b, `<td class="num" data-v="%f">%.1f</td>`, o.Cold.P50, o.Cold.P50)
@@ -365,8 +371,8 @@ func WriteHTML(path string, res *runner.Result) error {
 	b.WriteString(`</tbody></table></div>`)
 	b.WriteString(`<section class="details">`)
 	for i, o := range res.Ops {
-		fmt.Fprintf(&b, `<details class="op" id="op%d" data-status="%s"><summary>%s <b>%s</b> <span class="path">%s</span> <code>%s</code></summary><div class="body">`,
-			i, esc(o.Status), statusChip(o.Status), esc(o.Method), esc(o.Path), esc(o.BigO))
+		fmt.Fprintf(&b, `<details class="op" id="op%d" data-status="%s"><summary>%s <b>%s</b> <span class="path">%s</span>%s <code>%s</code></summary><div class="body">`,
+			i, esc(o.Status), statusChip(o.Status), esc(o.Method), esc(o.Path), roleTag(o), esc(o.BigO))
 		b.WriteString(`<dl class="facts">`)
 		fact := func(k, v string) { fmt.Fprintf(&b, `<div><dt>%s</dt><dd>%s</dd></div>`, esc(k), v) }
 		fact("Latency (warm)", fmt.Sprintf("p50 %.1f · p95 %.1f · p99 %.1f ms (n=%d)", o.Latency.P50, o.Latency.P95, o.Latency.P99, o.Latency.N))
@@ -452,7 +458,7 @@ func WriteHTML(path string, res *runner.Result) error {
 	if len(res.Skipped) > 0 {
 		b.WriteString(`<section><h2>Skipped</h2><ul>`)
 		for _, s := range res.Skipped {
-			fmt.Fprintf(&b, `<li><code>%s %s</code> — %s</li>`, esc(s.Method), esc(s.Path), esc(s.Skipped))
+			fmt.Fprintf(&b, `<li><code>%s</code> — %s</li>`, esc(s.Endpoint()), esc(s.Skipped))
 		}
 		b.WriteString(`</ul></section>`)
 	}

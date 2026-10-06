@@ -14,6 +14,8 @@ import (
 
 type authLogin = auth.Login
 type authOAuth = auth.OAuth2CC
+type authCreds = auth.Creds
+type authRole = auth.Role
 
 type prompter struct{ in *bufio.Reader }
 

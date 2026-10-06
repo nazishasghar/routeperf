@@ -30,6 +30,7 @@ func DefaultOptions() Options {
 type op struct {
 	Method     string                          `json:"method"`
 	Path       string                          `json:"path"`
+	Role       string                          `json:"role"`
 	Status     string                          `json:"status"`
 	BigO       string                          `json:"big_o"`
 	NDegree    *float64                        `json:"n_degree"`
@@ -95,7 +96,12 @@ func Compare(basePath, newPath string, o Options) (*Report, error) {
 		return nil, err
 	}
 	rep := &Report{Base: basePath, New: newPath}
-	key := func(x op) string { return x.Method + " " + x.Path }
+	key := func(x op) string {
+		if x.Role != "" {
+			return x.Method + " " + x.Path + " [" + x.Role + "]"
+		}
+		return x.Method + " " + x.Path
+	}
 	bm := map[string]op{}
 	for _, x := range base.Ops {
 		bm[key(x)] = x

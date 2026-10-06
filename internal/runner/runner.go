@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -70,15 +71,17 @@ type Runner struct {
 	db       db.DB
 	cap      db.Capture
 	closers  []func()
-	am       *auth.Manager
+	am       *auth.Manager            // default identity (top-level auth)
+	roleAM   map[string]*auth.Manager // named roles (auth.roles)
 	sp       *spec.Spec
-	res      *inputs.Resolver
+	res      *inputs.Resolver            // default identity's request state
+	roleRes  map[string]*inputs.Resolver // per role: links, cursors and fixtures stay separate
 	tables   map[string]*db.Table
 	fks      []db.FK
 	counts   map[float64]map[string]float64 // step → table → rows
 	ptCounts map[float64]map[string]float64 // per-table shrink step → table → rows
 	built    map[string]bool                // tables with subsets
-	created  map[string][]string            // collection path → created IDs
+	created  map[string][]string            // role + collection path → created IDs
 	baseURL  *url.URL
 	result   *Result
 	nsSteps  []float64
@@ -120,13 +123,62 @@ func New(cfg *Config, logf func(string, ...any)) *Runner {
 		built: map[string]bool{}, created: map[string][]string{}}
 }
 
+// amFor returns the credentials a role sends ("" = default identity).
+func (r *Runner) amFor(role string) *auth.Manager {
+	if m := r.roleAM[role]; m != nil {
+		return m
+	}
+	return r.am
+}
+
+// resFor returns the request builder of a role ("" = default identity).
+func (r *Runner) resFor(role string) *inputs.Resolver {
+	if rs := r.roleRes[role]; rs != nil {
+		return rs
+	}
+	return r.res
+}
+
+// specRole is the identity that fetches the spec: the default credentials,
+// or the first role when only roles have credentials.
+func (r *Runner) specRole() string {
+	if names := r.cfg.RoleNames(); len(names) > 0 && r.cfg.Auth.Creds.Empty() {
+		return names[0]
+	}
+	return ""
+}
+
+// rolesFor returns the identities o runs as: the run.as roles, else every
+// role whose ops patterns match it, else the default credentials ("").
+func (r *Runner) rolesFor(o *spec.Operation) []string {
+	if len(r.cfg.Run.As) > 0 {
+		out := make([]string, 0, len(r.cfg.Run.As))
+		for _, n := range r.cfg.Run.As {
+			if n == "default" {
+				n = ""
+			}
+			out = append(out, n)
+		}
+		return out
+	}
+	var out []string
+	for _, n := range r.cfg.RoleNames() {
+		if spec.MatchAny(r.cfg.Auth.Roles[n].Ops, o) {
+			out = append(out, n)
+		}
+	}
+	if len(out) == 0 {
+		return []string{""}
+	}
+	return out
+}
+
 func (r *Runner) fetch(ctx context.Context, src string) ([]byte, error) {
 	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
 		req, _ := http.NewRequestWithContext(ctx, "GET", src, nil)
-		if r.am != nil {
-			r.am.Apply(ctx, req)
-		}
-		resp, err := r.am.Client.Do(req)
+		am := r.amFor(r.specRole())
+		am.Apply(ctx, req)
+		resp, err := am.Client.Do(req)
 		if err != nil {
 			return nil, err
 		}
@@ -153,28 +205,22 @@ func (r *Runner) Close() {
 
 func (r *Runner) Spec() *spec.Spec { return r.sp }
 
-// Select filters operations and returns (selected, skipped).
-func (r *Runner) Select() ([]*spec.Operation, []*analyze.OpResult) {
+// Job is one operation run as one identity.
+type Job struct {
+	Op   *spec.Operation
+	Role string // "" = default credentials
+}
+
+// Select filters operations, expands each into one job per role it runs as,
+// and returns (selected, skipped).
+func (r *Runner) Select() ([]Job, []*analyze.OpResult) {
 	c := r.cfg
 	allowed := map[string]bool{}
 	for _, m := range c.Run.Methods {
 		allowed[m] = true
 	}
-	match := func(list []string, o *spec.Operation) bool {
-		for _, x := range list {
-			if strings.HasPrefix(x, "tag:") {
-				for _, t := range o.Tags {
-					if strings.EqualFold(t, x[4:]) {
-						return true
-					}
-				}
-			} else if strings.EqualFold(x, o.ID) || strings.EqualFold(x, o.Method+" "+o.Path) {
-				return true
-			}
-		}
-		return false
-	}
-	var sel []*spec.Operation
+	match := spec.MatchAny
+	var sel []Job
 	var skip []*analyze.OpResult
 	for _, o := range r.sp.Ops {
 		reason := ""
@@ -200,18 +246,42 @@ func (r *Runner) Select() ([]*spec.Operation, []*analyze.OpResult) {
 		case o.Unsupported != "":
 			reason = o.Unsupported
 		}
-		if reason == "" && r.am != nil && r.sp.Schemes != nil {
-			if ok, why := r.am.Satisfies(reqs, r.sp.Schemes); !ok {
-				reason = why
-			}
-		}
 		if reason != "" {
 			skip = append(skip, &analyze.OpResult{ID: o.ID, Method: o.Method, Path: o.Path, Phase: o.Phase, Skipped: reason})
 			continue
 		}
-		sel = append(sel, o)
+		for _, role := range r.rolesFor(o) {
+			if am := r.amFor(role); am != nil && r.sp.Schemes != nil {
+				if ok, why := am.Satisfies(reqs, r.sp.Schemes); !ok {
+					if role == "" && len(c.Auth.Roles) > 0 {
+						why += " (no auth role's ops match this operation)"
+					}
+					skip = append(skip, &analyze.OpResult{ID: o.ID, Method: o.Method, Path: o.Path, Phase: o.Phase, Role: role, Skipped: why})
+					continue
+				}
+			}
+			sel = append(sel, Job{Op: o, Role: role})
+		}
 	}
 	return sel, skip
+}
+
+// orderWrites puts write jobs in lifecycle order (spec.OrderWrites), keeping
+// an operation's roles together.
+func orderWrites(jobs []Job) []Job {
+	var ops []*spec.Operation
+	byOp := map[*spec.Operation][]Job{}
+	for _, j := range jobs {
+		if byOp[j.Op] == nil {
+			ops = append(ops, j.Op)
+		}
+		byOp[j.Op] = append(byOp[j.Op], j)
+	}
+	var out []Job
+	for _, o := range spec.OrderWrites(ops) {
+		out = append(out, byOp[o]...)
+	}
+	return out
 }
 
 // ------------------------------------------------------------ pending marker
@@ -261,19 +331,20 @@ func (r *Runner) sendHTTP(ctx context.Context, req *inputs.Request) (int, []byte
 			hr.Header.Set("Content-Type", ctype)
 		}
 		hr.Header.Set("Accept", "application/json")
-		r.am.Apply(ctx, hr)
+		am := r.amFor(req.Role)
+		am.Apply(ctx, hr)
 		for k, v := range req.Header {
 			hr.Header.Set(k, v)
 		}
 		t0 := time.Now()
-		resp, err := r.am.Client.Do(hr)
+		resp, err := am.Client.Do(hr)
 		if err != nil {
 			return 0, nil, nil, 0, err
 		}
 		b, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		ms := float64(time.Since(t0).Microseconds()) / 1000
-		if attempt == 0 && r.am.Refresh(ctx, resp.StatusCode) {
+		if attempt == 0 && am.Refresh(ctx, resp.StatusCode) {
 			continue
 		}
 		return resp.StatusCode, b, resp.Header, ms, nil
@@ -392,18 +463,22 @@ func jsonScalar(x any) string {
 
 func (r *Runner) Run(ctx context.Context) (*Result, error) {
 	c := r.cfg
-	ops, skipped := r.Select()
+	jobs, skipped := r.Select()
 	r.result.Skipped = skipped
-	var reads, writes []*spec.Operation
-	for _, o := range ops {
-		if o.Phase == "R" {
-			reads = append(reads, o)
+	var reads, writes []Job
+	for _, j := range jobs {
+		if j.Op.Phase == "R" {
+			reads = append(reads, j)
 		} else {
-			writes = append(writes, o)
+			writes = append(writes, j)
 		}
 	}
-	writes = spec.OrderWrites(writes)
-	r.log("%d operations selected (%d read, %d write), %d skipped", len(ops), len(reads), len(writes), len(skipped))
+	writes = orderWrites(writes)
+	what := "operations"
+	if len(c.Auth.Roles) > 0 || len(c.Run.As) > 0 {
+		what = "operation runs (one per role)"
+	}
+	r.log("%d %s selected (%d read, %d write), %d skipped", len(jobs), what, len(reads), len(writes), len(skipped))
 
 	mk := pending{DBURL: redactURL(c.DB.URL), Capture: !c.Proxy()}
 	writeMarker(mk)
@@ -427,12 +502,12 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 		r.log("background SQL detected while idle (%d statements); those query shapes are excluded", n)
 	}
 	var results []*analyze.OpResult
-	for _, o := range reads {
+	for _, j := range reads {
 		if ctx.Err() != nil {
 			break
 		}
 		r.idleProbe(ctx, 250*time.Millisecond)
-		results = append(results, r.runOp(ctx, o))
+		results = append(results, r.runOp(ctx, j))
 	}
 
 	// Subsets come from pristine data, before any write.
@@ -462,8 +537,8 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 			r.log("snapshot: copying %d tables to %s", len(all), db.SnapNS)
 			if err := r.db.Snapshot(ctx, all); err != nil {
 				r.result.Warnings = append(r.result.Warnings, "snapshot failed, write operations skipped: "+err.Error())
-				for _, o := range writes {
-					r.result.Skipped = append(r.result.Skipped, &analyze.OpResult{ID: o.ID, Method: o.Method, Path: o.Path, Phase: "W", Skipped: "snapshot failed"})
+				for _, j := range writes {
+					r.result.Skipped = append(r.result.Skipped, &analyze.OpResult{ID: j.Op.ID, Method: j.Op.Method, Path: j.Op.Path, Phase: "W", Role: j.Role, Skipped: "snapshot failed"})
 				}
 				writes = nil
 			} else {
@@ -474,12 +549,16 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 			}
 		}
 		c0, _ = r.db.Counters(ctx)
-		for _, o := range writes {
+		var writeOps []*spec.Operation
+		for _, j := range writes {
+			writeOps = append(writeOps, j.Op)
+		}
+		for _, j := range writes {
 			if ctx.Err() != nil {
 				break
 			}
 			r.idleProbe(ctx, 250*time.Millisecond)
-			res := r.runWrite(ctx, o, writes)
+			res := r.runWrite(ctx, j, writeOps)
 			if res != nil {
 				results = append(results, res)
 			}
@@ -489,7 +568,7 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 		r.coldPhase(ctx, results)
 	}
 	if c.Load.Enabled && ctx.Err() == nil {
-		r.loadPhase(ctx, results, ops)
+		r.loadPhase(ctx, results)
 	}
 	var touched []string
 	if snapshot {
@@ -577,21 +656,53 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 		r.result.Cache = "warm+cold"
 	}
 	r.result.Ops = results
-	r.result.Unresolved = r.res.Unresolved
-	misses := make([]string, 0, len(r.res.FixtureMisses))
-	for where := range r.res.FixtureMisses {
+	r.result.Unresolved = r.unresolved()
+	missed := map[string]string{}
+	for _, rs := range r.resolvers() {
+		for where, why := range rs.FixtureMisses {
+			missed[where] = why
+		}
+	}
+	misses := make([]string, 0, len(missed))
+	for where := range missed {
 		misses = append(misses, where)
 	}
 	sort.Strings(misses)
 	for _, where := range misses {
 		r.result.Warnings = append(r.result.Warnings, fmt.Sprintf("%s fixture %s found no value (%s); a sampled or generated value was used instead",
-			c.Fixtures, where, r.res.FixtureMisses[where]))
+			c.Fixtures, where, missed[where]))
 	}
 	r.result.Seconds = time.Since(r.result.Started).Seconds()
 	if !snapshot || len(r.result.Warnings) == 0 || r.result.Verified {
 		_ = os.Remove(markerPath())
 	}
 	return r.result, nil
+}
+
+// resolvers returns the default identity's request builder, then each role's.
+func (r *Runner) resolvers() []*inputs.Resolver {
+	all := []*inputs.Resolver{r.res}
+	for _, n := range r.cfg.RoleNames() {
+		if rs := r.roleRes[n]; rs != nil {
+			all = append(all, rs)
+		}
+	}
+	return all
+}
+
+// unresolved merges every identity's generated-without-a-source parameters.
+func (r *Runner) unresolved() map[string][]string {
+	out := map[string][]string{}
+	for _, rs := range r.resolvers() {
+		for op, params := range rs.Unresolved {
+			for _, p := range params {
+				if !slices.Contains(out[op], p) {
+					out[op] = append(out[op], p)
+				}
+			}
+		}
+	}
+	return out
 }
 
 func (r *Runner) timingSource() string {
@@ -698,32 +809,39 @@ func redactURL(raw string) string {
 
 // ------------------------------------------------------------ per-op runs
 
-func (r *Runner) newResult(o *spec.Operation) *analyze.OpResult {
-	return &analyze.OpResult{ID: o.ID, Method: o.Method, Path: o.Path, Phase: o.Phase, KSamples: map[int][]analyze.Sample{}, Statuses: map[int]int{}}
+func (r *Runner) newResult(j Job) *analyze.OpResult {
+	o := j.Op
+	return &analyze.OpResult{ID: o.ID, Method: o.Method, Path: o.Path, Phase: o.Phase, Role: j.Role, KSamples: map[int][]analyze.Sample{}, Statuses: map[int]int{}}
 }
 
-func (r *Runner) runOp(ctx context.Context, o *spec.Operation) *analyze.OpResult {
-	return r.runOpWith(ctx, o, func(int) map[string]string { return nil })
+// createdKey keys IDs created through a collection by the role that created
+// them: another role may not be allowed to see them.
+func createdKey(role, path string) string { return role + " " + path }
+
+func (r *Runner) runOp(ctx context.Context, j Job) *analyze.OpResult {
+	return r.runOpWith(ctx, j, func(int) map[string]string { return nil })
 }
 
-func (r *Runner) runOpWith(ctx context.Context, o *spec.Operation, overrides func(i int) map[string]string) *analyze.OpResult {
+func (r *Runner) runOpWith(ctx context.Context, j Job, overrides func(i int) map[string]string) *analyze.OpResult {
 	c := r.cfg
-	res := r.newResult(o)
-	ki := r.res.KParam(o)
+	o, rs := j.Op, r.resFor(j.Role)
+	res := r.newResult(j)
+	ki := rs.KParam(o)
 	if ki != nil {
 		res.KParam = ki.Name
 	}
 	observe := func(req *inputs.Request, s analyze.Sample, body []byte, hdr http.Header) {
-		r.res.Observe(o, req, s.Status, body, hdr)
+		rs.Observe(o, req, s.Status, body, hdr)
 		if o.Method == "POST" && s.Status < 300 && s.Status > 0 {
 			if id := extractID(body, hdr); id != "" {
-				r.created[o.Path] = append(r.created[o.Path], id)
+				k := createdKey(j.Role, o.Path)
+				r.created[k] = append(r.created[k], id)
 			}
 		}
 	}
 	n := c.Run.Warmup + c.Run.Iterations
 	for i := 0; i < n && ctx.Err() == nil; i++ {
-		req, err := r.res.Build(ctx, o, i, -1, ki, overrides(i))
+		req, err := rs.Build(ctx, o, i, -1, ki, overrides(i))
 		if err != nil {
 			res.Notes = append(res.Notes, err.Error())
 			break
@@ -731,18 +849,18 @@ func (r *Runner) runOpWith(ctx context.Context, o *spec.Operation, overrides fun
 		s, body, hdr := r.request(ctx, req, 0)
 		observe(req, s, body, hdr)
 		if s.Status >= 400 && c.Verbose && i == 0 {
-			r.log("    %s %s → %d: %s", o.Method, o.Path, s.Status, truncateSQL(string(body), 200))
+			r.log("    %s → %d: %s", res.Endpoint(), s.Status, truncateSQL(string(body), 200))
 		}
 		if i >= c.Run.Warmup {
 			res.Samples = append(res.Samples, s)
 		}
 	}
-	res.Pages = r.res.Pages(o)
+	res.Pages = rs.Pages(o)
 	if ki != nil && !c.Scale.Disabled {
 		iter := n
 		sample := func(k int) bool {
 			iter++
-			req, err := r.res.Build(ctx, o, iter, k, ki, overrides(iter))
+			req, err := rs.Build(ctx, o, iter, k, ki, overrides(iter))
 			if err != nil {
 				return false
 			}
@@ -757,7 +875,7 @@ func (r *Runner) runOpWith(ctx context.Context, o *spec.Operation, overrides fun
 				continue
 			}
 			iter++
-			if req, err := r.res.Build(ctx, o, iter, k, ki, overrides(iter)); err == nil { // warm this size once
+			if req, err := rs.Build(ctx, o, iter, k, ki, overrides(iter)); err == nil { // warm this size once
 				s, body, hdr := r.request(ctx, req, k)
 				observe(req, s, body, hdr)
 			}
@@ -788,7 +906,11 @@ func (r *Runner) runOpWith(ctx context.Context, o *spec.Operation, overrides fun
 		res.Statuses[s.Status]++
 	}
 	res.Latency = analyze.Latency{P50: analyze.Percentile(lat, 50), P95: analyze.Percentile(lat, 95), P99: analyze.Percentile(lat, 99), N: len(lat)}
-	r.log("  %-6s %-40s p50 %7.1fms  stmts/req %d", o.Method, o.Path, res.Latency.P50, medianStmts(res.Samples))
+	label := o.Path
+	if j.Role != "" {
+		label += " [" + j.Role + "]"
+	}
+	r.log("  %-6s %-40s p50 %7.1fms  stmts/req %d", o.Method, label, res.Latency.P50, medianStmts(res.Samples))
 	return res
 }
 
@@ -802,25 +924,27 @@ func medianStmts(ss []analyze.Sample) int {
 
 // runWrite runs a write op with lifecycle ID chaining: IDs come from OpenAPI
 // links when the spec declares them, else from the collection's POST.
-func (r *Runner) runWrite(ctx context.Context, o *spec.Operation, all []*spec.Operation) *analyze.OpResult {
+func (r *Runner) runWrite(ctx context.Context, j Job, all []*spec.Operation) *analyze.OpResult {
+	o, rs := j.Op, r.resFor(j.Role)
 	param := spec.LastParam(o.Path)
 	if o.Method == "POST" || param == "" || o.Protocol != "" && o.Protocol != "http" {
-		return r.runOp(ctx, o)
+		return r.runOp(ctx, j)
 	}
-	if o.Method != "DELETE" && r.res.HasLinks(o) { // PUT/PATCH reuse linked IDs
-		return r.runOp(ctx, o)
+	if o.Method != "DELETE" && rs.HasLinks(o) { // PUT/PATCH reuse linked IDs
+		return r.runOp(ctx, j)
 	}
 	coll := spec.CollectionPath(o.Path)
-	src, srcParam := r.res.LinkSource(o)
+	ck := createdKey(j.Role, coll)
+	src, srcParam := rs.LinkSource(o)
 	current := func() []string {
 		if src != nil {
 			var out []string
-			for _, v := range r.res.Linked(o.ID, srcParam) {
+			for _, v := range rs.Linked(o.ID, srcParam) {
 				out = append(out, fmt.Sprint(v))
 			}
 			return out
 		}
-		return r.created[coll]
+		return r.created[ck]
 	}
 	ids := current()
 	need := r.cfg.Run.Warmup + r.cfg.Run.Iterations + 8
@@ -835,16 +959,16 @@ func (r *Runner) runWrite(ctx context.Context, o *spec.Operation, all []*spec.Op
 			}
 		}
 		if creator != nil {
-			for j := 0; len(current()) < need && j < need*2; j++ {
-				req, err := r.res.Build(ctx, creator, 50000+j, -1, nil, nil)
+			for i := 0; len(current()) < need && i < need*2; i++ {
+				req, err := rs.Build(ctx, creator, 50000+i, -1, nil, nil)
 				if err != nil {
 					break
 				}
 				status, body, hdr, _, err := r.send(ctx, req)
 				if err == nil && status < 300 {
-					r.res.Observe(creator, req, status, body, hdr)
+					rs.Observe(creator, req, status, body, hdr)
 					if id := extractID(body, hdr); id != "" && src == nil {
-						r.created[coll] = append(r.created[coll], id)
+						r.created[ck] = append(r.created[ck], id)
 					}
 				}
 			}
@@ -853,21 +977,21 @@ func (r *Runner) runWrite(ctx context.Context, o *spec.Operation, all []*spec.Op
 	}
 	if len(ids) == 0 {
 		if o.Method == "DELETE" && r.result.Snapshot == "none" {
-			res := r.newResult(o)
+			res := r.newResult(j)
 			res.Skipped = "no tool-created resource to delete and no snapshot"
 			r.result.Skipped = append(r.result.Skipped, res)
 			return nil
 		}
-		return r.runOp(ctx, o) // anchors; snapshot restores
+		return r.runOp(ctx, j) // anchors; snapshot restores
 	}
 	if o.Method == "DELETE" {
 		pool := append([]string(nil), ids...)
 		if src != nil {
-			r.res.TakeLinked(o.ID, srcParam)
+			rs.TakeLinked(o.ID, srcParam)
 		} else {
-			r.created[coll] = nil
+			r.created[ck] = nil
 		}
-		return r.runOpWith(ctx, o, func(i int) map[string]string {
+		return r.runOpWith(ctx, j, func(i int) map[string]string {
 			if i < len(pool) {
 				return map[string]string{param: pool[len(pool)-1-i]}
 			}
@@ -875,7 +999,7 @@ func (r *Runner) runWrite(ctx context.Context, o *spec.Operation, all []*spec.Op
 		})
 	}
 	id := ids[0]
-	return r.runOpWith(ctx, o, func(int) map[string]string { return map[string]string{param: id} })
+	return r.runOpWith(ctx, j, func(int) map[string]string { return map[string]string{param: id} })
 }
 
 // ------------------------------------------------------------ subsets

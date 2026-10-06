@@ -1,6 +1,7 @@
 package inputs
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -72,5 +73,21 @@ func TestEncode(t *testing.T) {
 	b, ct, err = Encode(&Request{ContentType: "multipart/form-data", Body: map[string]any{"file": []byte("hello"), "caption": "me"}})
 	if err != nil || !strings.HasPrefix(ct, "multipart/form-data; boundary=") || !strings.Contains(string(b), `filename="file.txt"`) || !strings.Contains(string(b), "hello") {
 		t.Errorf("multipart: %s %s %v", ct, b, err)
+	}
+}
+
+func TestRoleFixtures(t *testing.T) {
+	op := &spec.Operation{ID: "listOrders", Method: "GET", Path: "/orders", Params: []spec.Param{{Name: "status", In: "query"}}}
+	fx := map[string]Fixture{
+		"listOrders":        {Query: map[string]any{"status": "all"}},
+		"listOrders@driver": {Query: map[string]any{"status": "assigned"}},
+	}
+	for role, want := range map[string]string{"": "all", "driver": "assigned", "admin": "all"} {
+		r := New(nil, nil, fx, nil)
+		r.Role = role
+		req, err := r.Build(context.Background(), op, 0, -1, nil, nil)
+		if err != nil || req.Query.Get("status") != want || req.Role != role {
+			t.Errorf("role %q: status %q role %q err %v, want %q", role, req.Query.Get("status"), req.Role, err, want)
+		}
 	}
 }

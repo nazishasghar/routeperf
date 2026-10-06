@@ -45,7 +45,8 @@ type Login struct {
 	RefreshOn []int `yaml:"refresh_on"`
 }
 
-type Config struct {
+// Creds are the credentials of one identity.
+type Creds struct {
 	Bearer        string            `yaml:"bearer"`
 	BearerCommand string            `yaml:"bearer_command,omitempty"` // shell command printing a token (e.g. gcloud auth print-access-token)
 	Headers       map[string]string `yaml:"headers"`
@@ -56,8 +57,30 @@ type Config struct {
 	Login         *Login            `yaml:"login"`
 }
 
+// Empty reports whether no credential is configured.
+func (c Creds) Empty() bool {
+	return c.Bearer == "" && c.BearerCommand == "" && len(c.Headers) == 0 && len(c.Cookies) == 0 && c.CookieJar == "" &&
+		len(c.Query) == 0 && c.OAuth2 == nil && c.Login == nil
+}
+
+// Dynamic reports whether the credentials come from a flow run at startup.
+func (c Creds) Dynamic() bool { return c.OAuth2 != nil || c.Login != nil || c.BearerCommand != "" }
+
+// Role is a named identity (admin, driver, customer…) and the operations it
+// calls.
+type Role struct {
+	Creds `yaml:",inline"`
+	Ops   []string `yaml:"ops,omitempty"` // operationIds, tag:<name>, "METHOD /path" or path globs; "*" = every operation
+}
+
+// Config is the default identity plus optional named roles.
+type Config struct {
+	Creds `yaml:",inline"`
+	Roles map[string]Role `yaml:"roles,omitempty"`
+}
+
 type Manager struct {
-	cfg    Config
+	cfg    Creds
 	base   *url.URL
 	Client *http.Client
 	jar    *cookiejar.Jar
@@ -66,7 +89,7 @@ type Manager struct {
 	exp    time.Time
 }
 
-func New(cfg Config, baseURL string, timeout time.Duration) (*Manager, error) {
+func New(cfg Creds, baseURL string, timeout time.Duration) (*Manager, error) {
 	base, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
@@ -253,7 +276,7 @@ func (m *Manager) tokenCommand(ctx context.Context) error {
 
 // Refresh re-runs dynamic flows after a 401 (or configured status).
 func (m *Manager) Refresh(ctx context.Context, status int) bool {
-	if m.cfg.OAuth2 == nil && m.cfg.Login == nil && m.cfg.BearerCommand == "" {
+	if !m.cfg.Dynamic() {
 		return false
 	}
 	if m.cfg.Login != nil && len(m.cfg.Login.RefreshOn) > 0 {
