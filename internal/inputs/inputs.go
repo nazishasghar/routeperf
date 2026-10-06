@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,17 +28,32 @@ type Fixture struct {
 }
 
 type Request struct {
-	Method string
-	Path   string // with params substituted
-	Query  url.Values
-	Header map[string]string
-	Body   any
+	Method      string
+	Path        string // with params substituted
+	Query       url.Values
+	Header      map[string]string
+	Body        any
+	ContentType string            // application/json (default), form-urlencoded or multipart/form-data
+	PathParams  map[string]string // values used for path parameters
+	Op          *spec.Operation
+	Page        int            // cursor page index (0 = first page)
+	Vars        map[string]any // GraphQL variables
 }
 
 type KInfo struct {
-	Name     string // query param name, or body array property
+	Name     string // query param / GraphQL argument name, or body property
 	InBody   bool
+	Scalar   bool // body integer (gRPC page_size) rather than an array
 	Min, Max int
+}
+
+// pathFor is the path used to map ID inputs to tables: GraphQL fields and
+// gRPC methods have no URL, so their resource stands in (user → /user/{id}).
+func pathFor(op *spec.Operation) string {
+	if op.Protocol == "graphql" || op.Protocol == "grpc" {
+		return "/" + op.Resource + "/{id}"
+	}
+	return op.Path
 }
 
 type Resolver struct {
@@ -49,13 +65,20 @@ type Resolver struct {
 	anchors    map[string][]string
 	Unresolved map[string][]string // opID → params generated without a source
 	FKs        []db.FK
+	Spec       *spec.Spec
+	linked     map[string]map[string][]any // target opID → param → values from links
+	linkBody   map[string][]any            // target opID → request bodies from links
+	cursor     map[string]string           // opID → next-page cursor
+	page       map[string]int              // opID → current page depth
+	maxPage    map[string]int
 }
 
 func New(d db.DB, tables map[string]*db.Table, fixtures map[string]Fixture, kparams []string) *Resolver {
 	b := make([]byte, 3)
 	_, _ = rand.Read(b)
 	return &Resolver{DB: d, Tables: tables, Fixtures: fixtures, KParams: kparams, RunID: hex.EncodeToString(b),
-		anchors: map[string][]string{}, Unresolved: map[string][]string{}}
+		anchors: map[string][]string{}, Unresolved: map[string][]string{}, linked: map[string]map[string][]any{},
+		linkBody: map[string][]any{}, cursor: map[string]string{}, page: map[string]int{}, maxPage: map[string]int{}}
 }
 
 var idName = regexp.MustCompile(`(?i)^(\w+?)_?id$`)
@@ -65,7 +88,18 @@ func (r *Resolver) tableFor(name, path string) *db.Table {
 	try := func(base string) *db.Table {
 		base = strings.ToLower(base)
 		for _, c := range []string{base, base + "s", base + "es", strings.TrimSuffix(base, "y") + "ies", strings.TrimSuffix(base, "s")} {
-			if t := r.Tables[c]; t != nil && t.PK != "" {
+			if t := r.Tables[c]; t != nil && t.PK != "" && t.HasData() {
+				return t
+			}
+		}
+		return nil
+	}
+	// /archive/orders/{id} → archive.orders (another schema or database)
+	qualified := func(schema, base string) *db.Table {
+		schema, base = strings.ToLower(schema), strings.ToLower(base)
+		for _, t := range r.Tables {
+			s := strings.ToLower(t.Schema)
+			if (s == schema || strings.HasSuffix(s, "_"+schema)) && strings.EqualFold(t.Name, base) && t.PK != "" {
 				return t
 			}
 		}
@@ -80,6 +114,11 @@ func (r *Resolver) tableFor(name, path string) *db.Table {
 		segs := strings.Split(strings.Trim(path, "/"), "/")
 		for i, s := range segs {
 			if strings.Trim(s, "{}") == name && i > 0 {
+				if i > 1 && !strings.HasPrefix(segs[i-2], "{") {
+					if t := qualified(segs[i-2], segs[i-1]); t != nil {
+						return t
+					}
+				}
 				if t := try(segs[i-1]); t != nil {
 					return t
 				}
@@ -92,38 +131,54 @@ func (r *Resolver) tableFor(name, path string) *db.Table {
 // Anchors returns PK values from the 1% nested subset so the same IDs exist
 // at every data-scale step.
 func (r *Resolver) Anchors(ctx context.Context, t *db.Table) []string {
-	key := t.Name
+	key := t.Key
 	if v, ok := r.anchors[key]; ok {
 		return v
 	}
-	q := fmt.Sprintf("SELECT s.%s FROM %s s WHERE %s ORDER BY s.%s LIMIT 50", t.PK, t.Name, r.anchorPred(t, "s", 0), t.PK)
+	if t.PK == "" || !t.HasData() {
+		r.anchors[key] = nil
+		return nil
+	}
+	pk := r.DB.Quote(t.PK)
+	q := fmt.Sprintf("SELECT s.%s FROM %s s WHERE %s ORDER BY s.%s LIMIT 50", pk, t.SQL, r.anchorPred(t, "s", 0), pk)
 	vals, err := r.DB.FirstValues(ctx, q)
 	if err != nil || len(vals) == 0 {
-		vals, _ = r.DB.FirstValues(ctx, fmt.Sprintf("SELECT %s FROM %s ORDER BY %s LIMIT 50", t.PK, t.Name, t.PK))
+		vals, _ = r.DB.FirstValues(ctx, fmt.Sprintf("SELECT %s FROM %s ORDER BY %s LIMIT 50", pk, t.SQL, pk))
 	}
 	r.anchors[key] = vals
 	return vals
 }
 
-// anchorPred mirrors subset membership: root tables by PK hash, child tables
+// anchorPred mirrors subset membership: root tables by key hash, child tables
 // by "all FK parents are anchors" — so anchors exist in every nested subset.
 func (r *Resolver) anchorPred(t *db.Table, alias string, depth int) string {
+	q := r.DB.Quote
 	var conds []string
 	if depth < 6 {
 		for _, f := range r.FKs {
-			p := r.Tables[strings.ToLower(f.Parent)]
-			if f.Child != t.Name || f.Parent == t.Name || p == nil {
+			p := r.Tables[f.Parent]
+			if f.Child != t.Key || f.Parent == t.Key || p == nil {
 				continue
 			}
 			pa := fmt.Sprintf("p%d", depth)
-			conds = append(conds, fmt.Sprintf("(%s.%s IS NULL OR %s.%s IN (SELECT %s.%s FROM %s %s WHERE %s))",
-				alias, f.ChildCol, alias, f.ChildCol, pa, f.ParentCol, p.Name, pa, r.anchorPred(p, pa, depth+1)))
+			var cc, pc, nulls []string
+			for i := range f.ChildCols {
+				cc = append(cc, alias+"."+q(f.ChildCols[i]))
+				pc = append(pc, pa+"."+q(f.ParentCols[i]))
+				nulls = append(nulls, alias+"."+q(f.ChildCols[i])+" IS NULL")
+			}
+			lhs, sel := cc[0], pc[0]
+			if len(cc) > 1 {
+				lhs, sel = "("+strings.Join(cc, ", ")+")", strings.Join(pc, ", ")
+			}
+			conds = append(conds, fmt.Sprintf("(%s OR %s IN (SELECT %s FROM %s %s WHERE %s))",
+				strings.Join(nulls, " OR "), lhs, sel, p.SQL, pa, r.anchorPred(p, pa, depth+1)))
 		}
 	}
 	if len(conds) > 0 {
 		return strings.Join(conds, " AND ")
 	}
-	return r.DB.HashPred(alias+"."+t.PK, 0.01)
+	return r.DB.HashPred(r.DB.KeyExpr(t, alias), 0.01)
 }
 
 func (r *Resolver) fixtureValue(ctx context.Context, v any, iter int) any {
@@ -159,7 +214,7 @@ func isKName(name string, list []string) bool {
 // KParam detects the output-size knob: a pagination query param or a body array.
 func (r *Resolver) KParam(op *spec.Operation) *KInfo {
 	for _, p := range op.Params {
-		if p.In == "query" && isKName(p.Name, r.KParams) && p.Schema != nil && (p.Schema.Type.Is("integer") || p.Schema.Type.Is("number")) {
+		if (p.In == "query" || p.In == "arg") && isKName(p.Name, r.KParams) && p.Schema != nil && (p.Schema.Type.Is("integer") || p.Schema.Type.Is("number")) {
 			k := &KInfo{Name: p.Name, Min: 1, Max: 1000}
 			if p.Schema.Min != nil {
 				k.Min = int(*p.Schema.Min)
@@ -172,6 +227,14 @@ func (r *Resolver) KParam(op *spec.Operation) *KInfo {
 	}
 	if op.Body != nil && op.Body.Schema != nil && op.Method != "GET" {
 		names := sortedProps(op.Body.Schema)
+		if op.Protocol == "grpc" {
+			for _, n := range names {
+				ps := op.Body.Schema.Properties[n].Value
+				if ps != nil && ps.Type.Is("integer") && isKName(n, r.KParams) {
+					return &KInfo{Name: n, InBody: true, Scalar: true, Min: 1, Max: 1000}
+				}
+			}
+		}
 		for _, n := range names {
 			ps := op.Body.Schema.Properties[n].Value
 			if ps != nil && ps.Type.Is("array") && ps.Items != nil && ps.Items.Value != nil && ps.Items.Value.Type.Is("object") {
@@ -202,13 +265,32 @@ func sortedProps(s *openapi3.Schema) []string {
 // overrides force path param values (ID chaining for write lifecycles).
 func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, ki *KInfo, overrides map[string]string) (*Request, error) {
 	fx := r.Fixtures[op.ID]
-	req := &Request{Method: op.Method, Path: op.Path, Query: url.Values{}, Header: map[string]string{}}
+	req := &Request{Method: op.Method, Path: op.Path, Query: url.Values{}, Header: map[string]string{}, PathParams: map[string]string{}, Op: op, Vars: map[string]any{}}
+	opPath := pathFor(op)
+	if op.Body != nil {
+		req.ContentType = op.Body.ContentType
+	}
 	unresolved := map[string]bool{}
+	cur := ""
+	if cp := CursorParam(op); cp != "" && k < 0 {
+		cur = r.cursor[op.ID]
+		req.Page = r.page[op.ID]
+	} else if cp != "" {
+		req.Page = -1 // k sweeps always read the first page
+	}
 	for _, p := range op.Params {
 		var val any
 		var have bool
 		if ov, ok := overrides[p.Name]; ok && p.In == "path" {
 			val, have = ov, true
+		}
+		if !have && cur != "" && p.In == "query" && p.Name == CursorParam(op) {
+			val, have = cur, true
+		}
+		if !have && (op.Phase == "W" || p.In != "path") {
+			if vs := r.linked[op.ID][p.Name]; len(vs) > 0 {
+				val, have = vs[iter%len(vs)], true
+			}
 		}
 		if !have {
 			var src map[string]any
@@ -227,8 +309,8 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 		if ki != nil && !ki.InBody && p.Name == ki.Name && k >= 0 {
 			val, have = k, true
 		}
-		if !have && (p.In == "path" || idName.MatchString(p.Name)) {
-			if t := r.tableFor(p.Name, op.Path); t != nil {
+		if !have && (p.In == "path" || idName.MatchString(p.Name) || p.In == "arg" && strings.EqualFold(p.Name, "id")) {
+			if t := r.tableFor(p.Name, opPath); t != nil {
 				if a := r.Anchors(ctx, t); len(a) > 0 {
 					val, have = a[iter%len(a)], true
 				}
@@ -246,7 +328,7 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 			}
 		}
 		if !have && p.Required {
-			val, have = r.gen(ctx, p.Schema, p.Name, op.Path, iter, 0), true
+			val, have = r.gen(ctx, p.Schema, p.Name, opPath, iter, 0), true
 			unresolved[p.In+":"+p.Name] = true
 		}
 		if !have {
@@ -255,6 +337,7 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 		s := fmt.Sprint(val)
 		switch p.In {
 		case "path":
+			req.PathParams[p.Name] = s
 			req.Path = strings.ReplaceAll(req.Path, "{"+p.Name+"}", url.PathEscape(s))
 		case "query":
 			req.Query.Set(p.Name, s)
@@ -262,6 +345,8 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 			req.Header[p.Name] = s
 		case "cookie":
 			req.Header["Cookie"] = strings.TrimPrefix(req.Header["Cookie"]+"; "+p.Name+"="+s, "; ")
+		case "arg":
+			req.Vars[p.Name] = typed(val, p.Schema)
 		}
 	}
 	if op.Body != nil {
@@ -282,7 +367,7 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 				if arr, ok := m[ki.Name].([]any); ok && len(arr) > 0 {
 					first = arr[0]
 				} else if ps := op.Body.Schema.Properties[ki.Name]; ps != nil && ps.Value != nil && ps.Value.Items != nil {
-					first = r.gen(ctx, ps.Value.Items.Value, ki.Name, op.Path, iter, 1)
+					first = r.gen(ctx, ps.Value.Items.Value, ki.Name, opPath, iter, 1)
 				}
 				arr := make([]any, k)
 				for i := range arr {
@@ -406,7 +491,7 @@ func (r *Resolver) gen(ctx context.Context, s *openapi3.Schema, name, path strin
 	}
 	switch {
 	case s.Type.Is("integer"), s.Type.Is("number"):
-		if idName.MatchString(name) && !strings.EqualFold(name, "id") {
+		if idName.MatchString(name) && (!strings.EqualFold(name, "id") || strings.Contains(path, "{id}")) {
 			if t := r.tableFor(name, path); t != nil {
 				if a := r.Anchors(ctx, t); len(a) > 0 {
 					return numOrString(a[iter%len(a)])
@@ -446,6 +531,16 @@ func (r *Resolver) gen(ctx context.Context, s *openapi3.Schema, name, path strin
 		return m
 	}
 	// strings
+	if s.Format == "binary" || s.Format == "byte" && strings.Contains(strings.ToLower(name), "file") {
+		return []byte(fmt.Sprintf("routeperf test file %s %d\n", r.RunID, iter))
+	}
+	if idName.MatchString(name) && s.Format != "uuid" && (!strings.EqualFold(name, "id") || strings.Contains(path, "{id}")) {
+		if t := r.tableFor(name, path); t != nil {
+			if a := r.Anchors(ctx, t); len(a) > 0 {
+				return a[iter%len(a)]
+			}
+		}
+	}
 	var v string
 	switch s.Format {
 	case "email":
@@ -471,6 +566,33 @@ func (r *Resolver) gen(ctx context.Context, s *openapi3.Schema, name, path strin
 	}
 	for uint64(len(v)) < s.MinLength {
 		v += "x"
+	}
+	return v
+}
+
+// typed converts a value to the JSON type its schema declares.
+func typed(v any, s *openapi3.Schema) any {
+	if s == nil || v == nil {
+		return v
+	}
+	str, isStr := v.(string)
+	switch {
+	case s.Type.Is("integer") && isStr:
+		if n, err := strconv.ParseInt(str, 10, 64); err == nil {
+			return n
+		}
+	case s.Type.Is("number") && isStr:
+		if f, err := strconv.ParseFloat(str, 64); err == nil {
+			return f
+		}
+	case s.Type.Is("boolean") && isStr:
+		return str == "true"
+	case s.Type.Is("string") && !isStr:
+		switch v.(type) {
+		case map[string]any, []any:
+			return v
+		}
+		return fmt.Sprint(v)
 	}
 	return v
 }

@@ -37,7 +37,7 @@ release:   ## cross-compile archives + checksums into dist/ (same names as GitHu
 	  os=$${p%/*}; arch=$${p#*/}; ext=""; [ $$os = windows ] && ext=.exe; \
 	  d=dist/routeperf_$${os}_$${arch}; mkdir -p $$d; \
 	  CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" -o $$d/routeperf$$ext ./cmd/routeperf || exit 1; \
-	  cp README.md routeperf.example.yaml $$d/; \
+	  cp README.md LICENSE routeperf.example.yaml $$d/; \
 	  if [ $$os = windows ]; then (cd dist && zip -qr routeperf_$${os}_$${arch}.zip routeperf_$${os}_$${arch}); \
 	  else tar -C dist -czf dist/routeperf_$${os}_$${arch}.tar.gz routeperf_$${os}_$${arch}; fi; \
 	  rm -rf $$d; echo "  dist/routeperf_$${os}_$${arch}"; \

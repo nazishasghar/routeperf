@@ -18,14 +18,31 @@ archives:
     format_overrides:
       - goos: windows
         formats: [zip]
-    files: [README.md, routeperf.example.yaml]
+    files: [README.md, LICENSE, routeperf.example.yaml]
 checksum:
   name_template: checksums.txt
 changelog:
   sort: asc
-# Homebrew: uncomment after creating github.com/nazishasghar/homebrew-tap (then: brew install nazishasghar/tap/routeperf)
-# brews:
-#   - repository: { owner: nazishasghar, name: homebrew-tap }
-#     homepage: https://github.com/nazishasghar/routeperf
-#     description: Per-route performance and Big O from an OpenAPI spec + EXPLAIN ANALYZE
-#     test: system "#{bin}/routeperf", "version"
+# Homebrew tap: publishes a cask to github.com/nazishasghar/homebrew-tap when the
+# HOMEBREW_TAP_GITHUB_TOKEN secret (a token that can push to that repo) is set;
+# otherwise the step is skipped. Users: brew install nazishasghar/tap/routeperf
+homebrew_casks:
+  - name: routeperf
+    repository:
+      owner: nazishasghar
+      name: homebrew-tap
+      token: '{{ envOrDefault "HOMEBREW_TAP_GITHUB_TOKEN" "" }}'
+    skip_upload: '{{ if eq (envOrDefault "HOMEBREW_TAP_GITHUB_TOKEN" "") "" }}true{{ else }}false{{ end }}'
+    directory: Casks
+    homepage: https://github.com/nazishasghar/routeperf
+    description: Per-endpoint performance and Big O from an OpenAPI, GraphQL or gRPC API plus EXPLAIN ANALYZE
+    license: MIT
+    commit_author:
+      name: routeperf-release
+      email: routeperf-release@users.noreply.github.com
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/routeperf"]
+          end

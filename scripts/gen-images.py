@@ -39,8 +39,8 @@ def banner():
     tx = 220
     o.append(f'<text x="{tx}" y="150" font-family="{SANS}" font-size="74" font-weight="800" fill="{C["white"]}" letter-spacing="-1.5">route<tspan fill="url(#accent)">perf</tspan></text>')
     o.append(f'<text x="{tx+2}" y="198" font-family="{SANS}" font-size="25" font-weight="600" fill="#d2dbe5">Per-endpoint performance &amp; Big O for your API</text>')
-    o.append(f'<text x="{tx+2}" y="236" font-family="{SANS}" font-size="17" fill="{C["muted"]}">OpenAPI spec → real requests → captured SQL → EXPLAIN ANALYZE</text>')
-    o.append(f'<text x="{tx+2}" y="261" font-family="{SANS}" font-size="17" fill="{C["muted"]}">on 1% → 100% of your data → Big O, N+1 and index fixes</text>')
+    o.append(f'<text x="{tx+2}" y="236" font-family="{SANS}" font-size="17" fill="{C["muted"]}">OpenAPI · GraphQL · gRPC → real requests → captured SQL → EXPLAIN ANALYZE</text>')
+    o.append(f'<text x="{tx+2}" y="261" font-family="{SANS}" font-size="17" fill="{C["muted"]}">on 1% → 100% of your data → Big O ± CI, N+1 and proven index fixes</text>')
     chips = [("PostgreSQL", C["blue"]), ("MySQL", C["cyan"]), ("N+1 detection", C["amber"]), ("Index advice", C["green"]), ("Big O", C["violet"])]
     x = tx + 2
     for label, col in chips:
@@ -143,11 +143,11 @@ def terminal():
 def how():
     W, H = 1280, 300
     steps = [
-        ("1", "Read the spec", ["Swagger 2.0 / OpenAPI 3", "every route, param, body", "and security scheme"], C["cyan"]),
+        ("1", "Read the API", ["OpenAPI · GraphQL · gRPC", "every route, param, body", "and security scheme"], C["cyan"]),
         ("2", "Call every route", ["real requests with your", "token · cookies · headers", "writes run on a snapshot"], C["blue"]),
-        ("3", "Capture the SQL", ["from the DB statement log", "queries/request, N+1,", "rows examined"], C["violet"]),
-        ("4", "Replay at scale", ["EXPLAIN ANALYZE on", "nested data subsets", ""], C["pink"]),
-        ("5", "Big O + fixes", ["index & N+1 fixes with SQL", "report.md · results.json", "CI exit codes"], C["green"]),
+        ("3", "Capture the SQL", ["statement log or wire proxy", "queries/request, N+1,", "rows examined"], C["violet"]),
+        ("4", "Replay at scale", ["EXPLAIN ANALYZE per", "subset and per table", ""], C["pink"]),
+        ("5", "Big O + fixes", ["fixes proven with HypoPG", "HTML · Markdown · JSON", "CI diff exit codes"], C["green"]),
     ]
     o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" aria-label="How routeperf works: read spec, call routes, capture SQL, replay at scale, Big O and fixes">',
          defs_common(), card(W, H)]
@@ -170,7 +170,7 @@ def how():
         if i < len(steps) - 1:
             ax = x + cw + 7
             o.append(f'<path d="M{ax},{y0+chh/2} h18 m-7,-7 l7,7 l-7,7" fill="none" stroke="{C["dim"]}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>')
-    o.append(f'<text x="{W/2}" y="{H-22}" text-anchor="middle" font-family="{SANS}" font-size="13.5" fill="{C["dim"]}">degree from rows-examined growth · log factors from the plan · N+1 and app-side cost from page-size sweeps</text>')
+    o.append(f'<text x="{W/2}" y="{H-22}" text-anchor="middle" font-family="{SANS}" font-size="13.5" fill="{C["dim"]}">degree from rows-examined growth (with 95% CI) · log factors from the plan · N+1 and app-side cost from page-size sweeps</text>')
     o.append('</svg>')
     open(OUT + "how-it-works.svg", "w").write("\n".join(o))
 

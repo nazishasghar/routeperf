@@ -17,7 +17,11 @@ type Stmt struct {
 	Kind        string   `json:"kind"`              // select|insert|update|delete|other
 	Generic     bool     `json:"generic,omitempty"` // replay with a generic (prepared-statement) plan
 	Fingerprint string   `json:"fp"`
-	Tables      []string `json:"tables,omitempty"`
+	Tables      []string `json:"tables,omitempty"` // catalog keys
+	Target      string   `json:"target,omitempty"` // DML target table key
+	TraceID     string   `json:"trace,omitempty"`  // sqlcommenter traceparent trace-id
+	Conn        string   `json:"-"`                // backend/connection id
+	RowsExam    float64  `json:"rows_examined,omitempty"`
 }
 
 type Sample struct {
@@ -28,6 +32,7 @@ type Sample struct {
 	Stmts  []Stmt  `json:"-"`
 	NStmts int     `json:"stmts"`
 	Noise  int     `json:"background_excluded,omitempty"`
+	Page   int     `json:"page,omitempty"`
 	Err    string  `json:"err,omitempty"`
 }
 
@@ -38,6 +43,7 @@ type ScalePoint struct {
 	Ms     float64    `json:"ms"`
 	Shape  string     `json:"shape"`
 	Plan   *plan.Plan `json:"-"`
+	Times  []float64  `json:"-"` // every replay timing (for the time-slope CI)
 	Errors string     `json:"error,omitempty"`
 }
 
@@ -76,6 +82,13 @@ type QueryResult struct {
 	Error        string                `json:"error,omitempty"`
 	Growth       map[string]NodeGrowth `json:"-"`
 	TriggerHeavy bool                  `json:"trigger_heavy,omitempty"`
+	PerTable     []TableGrowth         `json:"per_table,omitempty"`
+	Driver       string                `json:"driver,omitempty"`  // table whose size the data-scale steps vary
+	KSlope       float64               `json:"k_slope,omitempty"` // rows examined vs k
+	KSlopeCI     float64               `json:"k_slope_ci,omitempty"`
+	ColdMs       float64               `json:"cold_ms,omitempty"`    // first execution after cache eviction
+	ColdReads    float64               `json:"cold_reads,omitempty"` // pages read from outside shared buffers
+	Rejected     []Advice              `json:"rejected_advice,omitempty"`
 }
 
 type Latency struct {
@@ -86,11 +99,14 @@ type Latency struct {
 }
 
 type Advice struct {
-	Rule     string `json:"rule"`
-	Message  string `json:"message"`
-	SQL      string `json:"sql,omitempty"`
-	Expected string `json:"expected,omitempty"`
-	Query    string `json:"query,omitempty"`
+	Rule       string  `json:"rule"`
+	Message    string  `json:"message"`
+	SQL        string  `json:"sql,omitempty"`
+	Expected   string  `json:"expected,omitempty"`
+	Query      string  `json:"query,omitempty"`
+	Verified   string  `json:"verified,omitempty"` // HypoPG proof, e.g. "planner cost 21450 → 8.3"
+	CostBefore float64 `json:"cost_before,omitempty"`
+	CostAfter  float64 `json:"cost_after,omitempty"`
 }
 
 type OpResult struct {
@@ -112,6 +128,9 @@ type OpResult struct {
 	Redundant  []string           `json:"redundant,omitempty"`
 	AppFit     *Fit               `json:"app_fit,omitempty"`
 	AppKExp    float64            `json:"app_k_exp"`
+	AppSlope   float64            `json:"app_k_slope,omitempty"`
+	AppSlopeCI float64            `json:"app_k_slope_ci,omitempty"`
+	AppShare   float64            `json:"app_k_top_share,omitempty"` // share of app time from the top-degree term at the largest k
 	KLatency   map[int]float64    `json:"k_latency_ms,omitempty"`
 	Queries    []*QueryResult     `json:"queries"`
 	BigO       string             `json:"big_o"`
@@ -122,6 +141,32 @@ type OpResult struct {
 	Projection map[string]float64 `json:"projection_p50_ms,omitempty"`
 	Advice     []Advice           `json:"advice,omitempty"`
 	Notes      []string           `json:"notes,omitempty"`
+	NDegree    float64            `json:"n_degree"`
+	KDegree    float64            `json:"k_degree"`
+	Cold       *Latency           `json:"cold_latency_ms,omitempty"` // first hits after cache eviction
+	ColdDBMs   float64            `json:"cold_db_ms_per_request,omitempty"`
+	Pages      int                `json:"cursor_pages,omitempty"` // pages walked through a cursor
+	Load       []LoadStep         `json:"load,omitempty"`
+	LoadNote   string             `json:"load_verdict,omitempty"`
+}
+
+// LoadStep is one concurrency level of a load run.
+type LoadStep struct {
+	Concurrency int            `json:"concurrency"`
+	Requests    int            `json:"requests"`
+	Errors      int            `json:"errors"`
+	RPS         float64        `json:"rps"`
+	P50         float64        `json:"p50_ms"`
+	P95         float64        `json:"p95_ms"`
+	P99         float64        `json:"p99_ms"`
+	DBMs        float64        `json:"db_ms_per_request,omitempty"` // attributed via traceparent
+	QPerReq     float64        `json:"queries_per_request,omitempty"`
+	Unattrib    int            `json:"unattributed_statements,omitempty"`
+	MaxActive   int            `json:"db_active_max,omitempty"`
+	MaxConns    int            `json:"db_connections_max,omitempty"`
+	LockWaits   int            `json:"lock_waits_max,omitempty"`
+	Waits       map[string]int `json:"wait_events,omitempty"`
+	Blocked     map[string]int `json:"blocked_on,omitempty"`
 }
 
 // ---------------------------------------------------------------- verdicts
@@ -166,7 +211,10 @@ func AnalyzeQuery(q *QueryResult, tableRows map[string]float64) {
 			lo, hi = math.Min(lo, p.Y), math.Max(hi, p.Y)
 		}
 		if hi-lo < 5 { // a handful of rows at every size: constant work
-			wf = Fit{Class: O1, ClassName: O1.String(), OK: true, R2: 1, Points: wf.Points, Decades: wf.Decades, SlopeAgree: true, All: wf.All}
+			wf = Fit{Class: O1, ClassName: O1.String(), OK: true, R2: 1, Points: wf.Points, Decades: wf.Decades, SlopeAgree: true, All: wf.All, Slope: 0, SlopeCI: 0}
+		}
+		if tf.SlopeCI > 9 {
+			tf.SlopeCI = 9.99
 		}
 		maxT := 0.0
 		for _, p := range tm {
@@ -222,6 +270,9 @@ func AnalyzeQuery(q *QueryResult, tableRows map[string]float64) {
 			if dom == "" {
 				dom = domRel(q.Base.Root)
 			}
+			if dom == "" {
+				dom = q.Driver
+			}
 			if q.TriggerHeavy {
 				if d := triggerTarget(q); d != "" {
 					dom = d
@@ -249,11 +300,32 @@ func AnalyzeQuery(q *QueryResult, tableRows map[string]float64) {
 		} else {
 			conf--
 		}
-		if !fit.SlopeAgree {
+		if _, sure := Degree(fit.Slope, fit.SlopeCI); !sure || !fit.SlopeAgree {
 			conf--
 		}
 		if q.PlanFlip != "" {
 			conf--
+		}
+		if len(q.PerTable) >= 2 {
+			pe, note, consistent := perTableExpr(q, fit.Slope, fit.SlopeCI)
+			q.Notes = append(q.Notes, note)
+			var logs Expr
+			for _, t := range q.Expr.Terms {
+				if n, _, k, _ := t.dims(); n == 0 && k == 0 {
+					logs.Terms = append(logs.Terms, t)
+				}
+			}
+			for _, t := range static.Terms {
+				if n, _, k, _ := t.dims(); n == 0 && k == 0 {
+					logs.Terms = append(logs.Terms, t)
+				}
+			}
+			q.Expr = pe.Add(logs).Simplify()
+			q.Degree, q.Dominant = q.Expr.NDegree(), q.Expr.Dominant()
+			if !consistent {
+				conf--
+				q.Notes = append(q.Notes, "per-table and joint growth disagree; treat the attribution with care")
+			}
 		}
 	} else {
 		conf = -2
@@ -324,6 +396,7 @@ func AnalyzeRoute(r *OpResult, p95Limit float64, maxQ float64) {
 		e = e.Add(Expr{Terms: []Term{T(map[string]float64{"k": r.AppKExp}, nil)}})
 	}
 	e = e.Simplify()
+	r.NDegree, r.KDegree = e.NDegree(), e.KDegree()
 	r.BigO = e.String()
 	r.Dominant = e.Dominant()
 	r.Confidence = []string{"low", "medium", "high"}[minConf]
@@ -346,8 +419,10 @@ func AnalyzeRoute(r *OpResult, p95Limit float64, maxQ float64) {
 	if len(r.NPlusOne) > 0 {
 		bump("WARN", "N+1 queries")
 	}
-	if r.AppKExp >= 1.6 {
-		bump("WARN", fmt.Sprintf("app-side work grows ~k^%.1f", r.AppKExp))
+	if r.AppKExp >= 2 {
+		bump("WARN", fmt.Sprintf("app-side work grows ~k² (%.0f%% of app time at the largest k; log-log slope %s)", r.AppShare*100, FmtSlope(r.AppSlope, r.AppSlopeCI)))
+	} else if r.AppSlope-r.AppSlopeCI > 1.2 {
+		bump("WARN", fmt.Sprintf("app-side work grows ~k^%s", FmtSlope(r.AppSlope, r.AppSlopeCI)))
 	}
 	if p95Limit > 0 && r.Latency.P95 > p95Limit {
 		bump("FAIL", fmt.Sprintf("p95 %.0fms > %.0fms", r.Latency.P95, p95Limit))

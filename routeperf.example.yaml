@@ -1,14 +1,19 @@
 # routeperf configuration. Values support ${ENV_VAR} and ${ENV_VAR:-default}.
-spec: http://localhost:3000/swagger.json
+spec: http://localhost:3000/swagger.json   # OpenAPI/Swagger URL or file; or a GraphQL endpoint / .graphql SDL; or grpc://host:port / .proto files
 api:
   base_url: http://localhost:3000
   timeout: 30s
+  # protocol: openapi            # openapi | graphql | grpc (auto-detected from spec)
+  # graphql_path: /graphql       # GraphQL: endpoint path when spec is an SDL file
+  # grpc: { target: localhost:50051, tls: false, import_paths: [./proto] }
 db:
   url: ${DATABASE_URL}          # postgres://user@localhost:5432/app  or  mysql://root@127.0.0.1:3306/app
   allow_remote: false           # never point at production
+  # schemas: [reporting]        # MySQL: other databases the app reads (Postgres sees every schema)
 
 auth:                           # any combination
   bearer: ${API_TOKEN:-}
+  # bearer_command: gcloud auth print-access-token   # run once (and again on 401) to get the token
   headers: {}                   # e.g. { X-Tenant-Id: acme, X-Api-Key: "${API_KEY}" }
   cookies: {}                   # e.g. { session: "${SESSION_COOKIE}" }
   # cookie_jar: ./cookies.txt   # Netscape/curl format
@@ -26,9 +31,12 @@ auth:                           # any combination
   #   refresh_on: [401]
 
 capture:
+  mode: log                     # log: server statement log (needs admin) | proxy: wire proxy, point the app at proxy_listen
+  # proxy_listen: 127.0.0.1:6543
   # pg_log_file: /opt/homebrew/var/log/postgresql@18.log   # auto-detected when omitted (or docker:<container>)
   pg_plan_mode: auto            # auto: use a generic plan when the app's prepared statements do | custom | generic
   settle: 40ms
+  traceparent: true             # send W3C traceparent; SQL tagged by sqlcommenter is attributed by trace id
 
 run:
   methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
@@ -42,7 +50,24 @@ run:
 scale:
   data_steps: [0.01, 0.03, 0.10, 0.30, 1.0]
   k_steps: [1, 10, 100, 250, 500, 1000]
-  repeats: 3
+  repeats: 3                    # minimum repeats per point
+  max_repeats: 12               # keep repeating until the slope's 95% CI is within ci_target
+  ci_target: 0.1
+  per_table: true               # also shrink one table at a time to attribute growth
+
+cache:
+  cold: false                   # also measure first hits after evicting the tables from the DB cache
+  # cold_cmd: "sync && sudo purge"   # optional: drop OS caches too before each cold sample
+  cold_samples: 3
+
+advice:
+  verify: true                  # prove index advice with HypoPG (Postgres) before reporting it
+
+load:
+  enabled: false                # concurrent load per endpoint (lock contention, pool limits)
+  concurrency: [1, 4, 16, 32]
+  duration: 5s
+  writes: false
 
 writes:
   snapshot: tables              # tables | none
@@ -50,6 +75,10 @@ writes:
 thresholds:
   p95_ms: 300
   max_queries_per_request: 10
+
+report:
+  mask_literals: false          # replace SQL literals/parameters with ? in every report
+  html: true                    # also write report.html
 
 fixtures: fixtures.yaml
 out: routeperf-out

@@ -40,7 +40,9 @@ func isNumber(s string) bool {
 	return s != ""
 }
 
-func sortCols(k string) []string {
+// sortCols returns the sort key's columns that belong to the scanned table
+// (qualifier matching its alias or name, or unqualified).
+func sortCols(k string, n *plan.Node) []string {
 	var out []string
 	for _, part := range strings.Split(k, ",") {
 		part = strings.TrimSpace(part)
@@ -50,6 +52,10 @@ func sortCols(k string) []string {
 		f := strings.Fields(part)
 		col := f[0]
 		if i := strings.LastIndex(col, "."); i >= 0 {
+			q := strings.Trim(strings.TrimPrefix(col[:i], "("), "`\"")
+			if n != nil && q != "" && !strings.EqualFold(q, n.Alias) && !strings.EqualFold(q, n.Relation) && !strings.HasSuffix(strings.ToLower(n.Relation), "."+strings.ToLower(q)) {
+				continue
+			}
 			col = col[i+1:]
 		}
 		col = strings.Trim(col, "`\"()")
@@ -65,7 +71,7 @@ func sortCols(k string) []string {
 type AdviseCtx struct {
 	Dialect     string                         // postgres | mysql
 	TableRows   map[string]float64             // table → rows
-	UnindexedFK map[string][]string            // parent → ["child.col"]
+	UnindexedFK map[string][]string            // parent key → ["child key|col1,col2"]
 	Cols        map[string]map[string]bool     // table → columns
 	Indexes     map[string]map[string][]string // table → index name → ordered columns
 }
@@ -189,7 +195,7 @@ func Advise(r *OpResult, ac AdviseCtx) {
 				if len(cols) > 0 && (out <= 0.5*examined || topN) {
 					idx := cols
 					if sortKey != "" {
-						for _, s := range sortCols(sortKey) {
+						for _, s := range sortCols(sortKey, n) {
 							if !contains(idx, strings.TrimSuffix(s, " DESC")) && isCol(n.Relation, s) {
 								idx = append(idx, s)
 							}
@@ -263,9 +269,10 @@ func Advise(r *OpResult, ac AdviseCtx) {
 		if q.Kind == "delete" || q.Kind == "update" {
 			for _, rel := range q.Base.Relations() {
 				for _, child := range unindexedFK[rel] {
-					ct, cc, _ := strings.Cut(child, ".")
-					add(Advice{Rule: "unindexed_fk", Query: q.ID, Message: fmt.Sprintf("FK %s has no index; every %s on %s scans %s", child, strings.ToUpper(q.Kind), rel, ct),
-						SQL: ac.createIndex(ct, []string{cc})})
+					ct, cc, _ := strings.Cut(child, "|")
+					cols := strings.Split(cc, ",")
+					add(Advice{Rule: "unindexed_fk", Query: q.ID, Message: fmt.Sprintf("FK %s(%s) has no index; every %s on %s scans %s", ct, cc, strings.ToUpper(q.Kind), rel, ct),
+						SQL: ac.createIndex(ct, cols)})
 				}
 			}
 		}

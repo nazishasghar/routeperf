@@ -31,17 +31,31 @@ type Body struct {
 }
 
 type Operation struct {
-	ID       string
-	Method   string
-	Path     string
-	Summary  string
-	Tags     []string
-	Params   []Param
-	Body     *Body
-	Security *openapi3.SecurityRequirements // nil → inherit global
-	Resource string
-	Depth    int
-	Phase    string // R or W
+	ID          string
+	Method      string
+	Path        string
+	Summary     string
+	Tags        []string
+	Params      []Param
+	Body        *Body
+	Security    *openapi3.SecurityRequirements // nil → inherit global
+	Resource    string
+	Depth       int
+	Phase       string // R or W
+	Links       []Link // OpenAPI response links to other operations
+	Protocol    string // "" / http | graphql | grpc
+	Unsupported string // reason the operation can't be called
+	GraphQL     *GraphQLOp
+	GRPC        *GRPCOp
+}
+
+// Link is an OpenAPI 3 response link: values from this operation's response
+// (or request) feed parameters of another operation.
+type Link struct {
+	Status string         // response code the link is declared on ("201", "2XX", "default")
+	Target string         // operationId
+	Params map[string]any // parameter name → runtime expression or constant
+	Body   any            // requestBody expression or constant
 }
 
 type Spec struct {
@@ -136,32 +150,43 @@ func Load(ctx context.Context, data []byte) (*Spec, error) {
 			addParams(op.Parameters)
 			addParams(item.Parameters)
 			if op.RequestBody != nil && op.RequestBody.Value != nil {
-				for _, ct := range []string{"application/json", "application/*+json", "*/*"} {
-					if mt := op.RequestBody.Value.Content.Get(ct); mt != nil {
-						b := &Body{ContentType: "application/json", Example: mt.Example}
-						if mt.Schema != nil {
-							b.Schema = mt.Schema.Value
-						}
-						if b.Example == nil {
-							for _, e := range mt.Examples {
-								if e != nil && e.Value != nil {
-									b.Example = e.Value.Value
-									break
-								}
-							}
-						}
-						o.Body = b
+				o.Body = pickBody(op.RequestBody.Value.Content)
+				if o.Body == nil && len(op.RequestBody.Value.Content) > 0 {
+					for ct := range op.RequestBody.Value.Content {
+						o.Unsupported = "request body type " + ct + " is not supported"
 						break
 					}
 				}
-				if o.Body == nil {
-					for ct, mt := range op.RequestBody.Value.Content {
-						b := &Body{ContentType: ct, Example: mt.Example}
-						if mt.Schema != nil {
-							b.Schema = mt.Schema.Value
+			}
+			if op.Responses != nil {
+				codes := make([]string, 0, op.Responses.Len())
+				for code := range op.Responses.Map() {
+					codes = append(codes, code)
+				}
+				sort.Strings(codes)
+				for _, code := range codes {
+					rr := op.Responses.Value(code)
+					if rr == nil || rr.Value == nil {
+						continue
+					}
+					names := make([]string, 0, len(rr.Value.Links))
+					for n := range rr.Value.Links {
+						names = append(names, n)
+					}
+					sort.Strings(names)
+					for _, n := range names {
+						l := rr.Value.Links[n]
+						if l == nil || l.Value == nil {
+							continue
 						}
-						o.Body = b
-						break
+						target := l.Value.OperationID
+						if target == "" && l.Value.OperationRef != "" {
+							target = "ref:" + l.Value.OperationRef
+						}
+						if target == "" {
+							continue
+						}
+						o.Links = append(o.Links, Link{Status: code, Target: target, Params: l.Value.Parameters, Body: l.Value.RequestBody})
 					}
 				}
 			}
@@ -180,7 +205,80 @@ func Load(ctx context.Context, data []byte) (*Spec, error) {
 		}
 	}
 	sort.Slice(s.Ops, func(i, j int) bool { return s.Ops[i].Path+s.Ops[i].Method < s.Ops[j].Path+s.Ops[j].Method })
+	s.ResolveLinks()
 	return s, nil
+}
+
+// pickBody chooses the request body encoding: JSON first, then form
+// encodings; nil when none is supported.
+func pickBody(content openapi3.Content) *Body {
+	for _, ct := range []string{"application/json", "application/*+json", "application/x-www-form-urlencoded", "multipart/form-data", "*/*"} {
+		mt := content.Get(ct)
+		if mt == nil {
+			continue
+		}
+		real := ct
+		if ct == "*/*" || strings.Contains(ct, "json") {
+			real = "application/json"
+		}
+		b := &Body{ContentType: real, Example: mt.Example}
+		if mt.Schema != nil {
+			b.Schema = mt.Schema.Value
+		}
+		if b.Example == nil {
+			for _, e := range mt.Examples {
+				if e != nil && e.Value != nil {
+					b.Example = e.Value.Value
+					break
+				}
+			}
+		}
+		return b
+	}
+	for ct, mt := range content { // vendor JSON types
+		if strings.Contains(ct, "json") {
+			b := &Body{ContentType: "application/json", Example: mt.Example}
+			if mt.Schema != nil {
+				b.Schema = mt.Schema.Value
+			}
+			return b
+		}
+	}
+	return nil
+}
+
+// ResolveLinks maps operationRef link targets (#/paths/~1users~1{id}/get) to
+// operation IDs.
+func (s *Spec) ResolveLinks() {
+	for _, o := range s.Ops {
+		for i, l := range o.Links {
+			ref, ok := strings.CutPrefix(l.Target, "ref:")
+			if !ok {
+				continue
+			}
+			_, frag, _ := strings.Cut(ref, "#")
+			parts := strings.Split(strings.TrimPrefix(frag, "/"), "/")
+			if len(parts) != 3 || parts[0] != "paths" {
+				continue
+			}
+			path := strings.NewReplacer("~1", "/", "~0", "~").Replace(parts[1])
+			for _, t := range s.Ops {
+				if t.Path == path && strings.EqualFold(t.Method, parts[2]) {
+					o.Links[i].Target = t.ID
+				}
+			}
+		}
+	}
+}
+
+// ByID returns the operation with the given ID.
+func (s *Spec) ByID(id string) *Operation {
+	for _, o := range s.Ops {
+		if o.ID == id {
+			return o
+		}
+	}
+	return nil
 }
 
 // OrderWrites returns write ops in lifecycle order: POST (parents first),
@@ -227,4 +325,19 @@ func Dangerous(o *Operation) bool {
 		return true
 	}
 	return o.Method == "DELETE" && LastParam(o.Path) == ""
+}
+
+// GraphQLOp describes a GraphQL root field call.
+type GraphQLOp struct {
+	Kind     string // query | mutation
+	Field    string
+	Document string // query text with $variables
+	Name     string // operationName
+}
+
+// GRPCOp describes a unary gRPC method.
+type GRPCOp struct {
+	FullMethod string // /pkg.Service/Method
+	Input      any    // protoreflect.MessageDescriptor (kept untyped to avoid importing protobuf here)
+	Output     any
 }
