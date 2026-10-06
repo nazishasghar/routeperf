@@ -3,8 +3,9 @@
 package runner
 
 import (
-	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,67 +25,89 @@ import (
 	"github.com/nazishasghar/routeperf/internal/db"
 	"github.com/nazishasghar/routeperf/internal/inputs"
 	"github.com/nazishasghar/routeperf/internal/spec"
-	"github.com/nazishasghar/routeperf/internal/sqlutil"
 )
 
 type Result struct {
-	Tool       string              `json:"tool"`
-	Started    time.Time           `json:"started"`
-	Seconds    float64             `json:"seconds"`
-	Spec       string              `json:"spec"`
-	SpecTitle  string              `json:"spec_title"`
-	API        string              `json:"api"`
-	Dialect    string              `json:"dialect"`
-	DBVersion  string              `json:"db_version"`
-	Database   string              `json:"database"`
-	Tables     map[string]float64  `json:"tables"`
-	DataSteps  []float64           `json:"data_steps"`
-	Ops        []*analyze.OpResult `json:"operations"`
-	Skipped    []*analyze.OpResult `json:"skipped"`
-	Snapshot   string              `json:"snapshot"`
-	Restored   []string            `json:"restored_tables,omitempty"`
-	Verified   bool                `json:"restore_verified"`
-	Warnings   []string            `json:"warnings,omitempty"`
-	Unresolved map[string][]string `json:"unresolved_params,omitempty"`
-	secrets    []string
+	Tool        string              `json:"tool"`
+	Version     string              `json:"version,omitempty"`
+	Started     time.Time           `json:"started"`
+	Seconds     float64             `json:"seconds"`
+	Spec        string              `json:"spec"`
+	SpecTitle   string              `json:"spec_title"`
+	Protocol    string              `json:"protocol,omitempty"`
+	API         string              `json:"api"`
+	Dialect     string              `json:"dialect"`
+	DBVersion   string              `json:"db_version"`
+	Database    string              `json:"database"`
+	Capture     string              `json:"capture,omitempty"`
+	DBTime      string              `json:"db_time_source,omitempty"` // server log | performance_schema | proxy | replay estimate
+	Cache       string              `json:"cache,omitempty"`          // warm | warm+cold
+	Correlated  bool                `json:"traceparent_correlation,omitempty"`
+	Masked      bool                `json:"literals_masked,omitempty"`
+	Tables      map[string]float64  `json:"tables"`
+	DataSteps   []float64           `json:"data_steps"`
+	Ops         []*analyze.OpResult `json:"operations"`
+	Skipped     []*analyze.OpResult `json:"skipped"`
+	Snapshot    string              `json:"snapshot"`
+	Restored    []string            `json:"restored_tables,omitempty"`
+	Verified    bool                `json:"restore_verified"`
+	AdviceProof string              `json:"advice_proof,omitempty"` // hypopg | unavailable
+	ColdMethod  string              `json:"cold_method,omitempty"`
+	Warnings    []string            `json:"warnings,omitempty"`
+	Unresolved  map[string][]string `json:"unresolved_params,omitempty"`
+	secrets     []string
 }
 
 // Secrets returns credential values to redact from any output.
 func (r *Result) Secrets() []string { return r.secrets }
 
+// SetSecrets is used when re-rendering a saved result.
+func (r *Result) SetSecrets(s []string) { r.secrets = s }
+
 type Runner struct {
-	cfg     *Config
-	log     func(format string, a ...any)
-	db      db.DB
-	am      *auth.Manager
-	sp      *spec.Spec
-	res     *inputs.Resolver
-	tables  map[string]*db.Table
-	fks     []db.FK
-	counts  map[float64]map[string]float64 // step → table → rows
-	built   map[string]bool                // tables with subsets
-	created map[string][]string            // collection path → created IDs
-	baseURL *url.URL
-	result  *Result
-	nsSteps []float64
-	bg      map[string]string // fingerprints seen while no request was in flight
+	cfg      *Config
+	log      func(format string, a ...any)
+	db       db.DB
+	cap      db.Capture
+	closers  []func()
+	am       *auth.Manager
+	sp       *spec.Spec
+	res      *inputs.Resolver
+	tables   map[string]*db.Table
+	fks      []db.FK
+	counts   map[float64]map[string]float64 // step → table → rows
+	ptCounts map[float64]map[string]float64 // per-table shrink step → table → rows
+	built    map[string]bool                // tables with subsets
+	created  map[string][]string            // collection path → created IDs
+	baseURL  *url.URL
+	result   *Result
+	nsSteps  []float64
+	bg       map[string]string // fingerprints seen while no request was in flight
+	corr     bool              // statements carry our traceparent: attribute by trace id
+	tr       transport
+}
+
+// transport sends a built request (HTTP/OpenAPI, GraphQL or gRPC).
+type transport interface {
+	Send(ctx context.Context, req *inputs.Request) (int, []byte, http.Header, float64, error)
+	Close()
 }
 
 // idleProbe watches the statement log while routeperf sends nothing; any SQL
 // seen comes from background jobs or other clients and is excluded later.
 func (r *Runner) idleProbe(ctx context.Context, d time.Duration) int {
-	m0, err := r.db.Mark(ctx)
+	m0, err := r.cap.Mark(ctx)
 	if err != nil {
 		return 0
 	}
 	time.Sleep(d)
-	m1, _ := r.db.Mark(ctx)
-	stmts, _ := r.db.Window(ctx, m0, m1)
+	m1, _ := r.cap.Mark(ctx)
+	stmts, _ := r.cap.Window(ctx, m0, m1)
 	if r.bg == nil {
 		r.bg = map[string]string{}
 	}
 	for _, st := range stmts {
-		if st.Kind != "other" {
+		if st.Kind != "other" && st.TraceID == "" {
 			r.bg[st.Fingerprint] = st.SQL
 		}
 	}
@@ -93,7 +116,8 @@ func (r *Runner) idleProbe(ctx context.Context, d time.Duration) int {
 
 func New(cfg *Config, logf func(string, ...any)) *Runner {
 	cfg.Defaults()
-	return &Runner{cfg: cfg, log: logf, counts: map[float64]map[string]float64{}, built: map[string]bool{}, created: map[string][]string{}}
+	return &Runner{cfg: cfg, log: logf, counts: map[float64]map[string]float64{}, ptCounts: map[float64]map[string]float64{},
+		built: map[string]bool{}, created: map[string][]string{}}
 }
 
 func (r *Runner) fetch(ctx context.Context, src string) ([]byte, error) {
@@ -116,6 +140,12 @@ func (r *Runner) fetch(ctx context.Context, src string) ([]byte, error) {
 }
 
 func (r *Runner) Close() {
+	for i := len(r.closers) - 1; i >= 0; i-- {
+		r.closers[i]()
+	}
+	if r.tr != nil {
+		r.tr.Close()
+	}
 	if r.db != nil {
 		r.db.Close()
 	}
@@ -152,8 +182,12 @@ func (r *Runner) Select() ([]*spec.Operation, []*analyze.OpResult) {
 		if o.Security != nil {
 			reqs = *o.Security
 		}
+		method := o.Method
+		if o.Protocol != "" && o.Protocol != "http" { // GraphQL / gRPC: map to read/write
+			method = map[string]string{"R": "GET", "W": "POST"}[o.Phase]
+		}
 		switch {
-		case !allowed[o.Method]:
+		case !allowed[method]:
 			reason = "method not enabled"
 		case len(c.Run.Include) > 0 && !match(c.Run.Include, o):
 			reason = "not included"
@@ -163,8 +197,10 @@ func (r *Runner) Select() ([]*spec.Operation, []*analyze.OpResult) {
 			reason = "dangerous operation (list it in run.dangerous_ops to run)"
 		case o.Phase == "W" && !c.WritesEnabled():
 			reason = "writes disabled"
+		case o.Unsupported != "":
+			reason = o.Unsupported
 		}
-		if reason == "" {
+		if reason == "" && r.am != nil && r.sp.Schemes != nil {
 			if ok, why := r.am.Satisfies(reqs, r.sp.Schemes); !ok {
 				reason = why
 			}
@@ -198,24 +234,31 @@ func writeMarker(p pending) {
 // ------------------------------------------------------------ HTTP
 
 func (r *Runner) send(ctx context.Context, req *inputs.Request) (int, []byte, http.Header, float64, error) {
+	if r.tr != nil {
+		return r.tr.Send(ctx, req)
+	}
+	return r.sendHTTP(ctx, req)
+}
+
+func (r *Runner) sendHTTP(ctx context.Context, req *inputs.Request) (int, []byte, http.Header, float64, error) {
 	u := *r.baseURL
 	u.Path = strings.TrimRight(u.Path, "/") + req.Path
 	u.RawQuery = req.Query.Encode()
-	var body io.Reader
-	var raw []byte
-	if req.Body != nil {
-		raw, _ = json.Marshal(req.Body)
+	raw, ctype, err := inputs.Encode(req)
+	if err != nil {
+		return 0, nil, nil, 0, err
 	}
 	for attempt := 0; attempt < 2; attempt++ {
+		var body io.Reader
 		if raw != nil {
-			body = bytes.NewReader(raw)
+			body = strings.NewReader(string(raw))
 		}
 		hr, err := http.NewRequestWithContext(ctx, req.Method, u.String(), body)
 		if err != nil {
 			return 0, nil, nil, 0, err
 		}
 		if raw != nil {
-			hr.Header.Set("Content-Type", "application/json")
+			hr.Header.Set("Content-Type", ctype)
 		}
 		hr.Header.Set("Accept", "application/json")
 		r.am.Apply(ctx, hr)
@@ -238,10 +281,25 @@ func (r *Runner) send(ctx context.Context, req *inputs.Request) (int, []byte, ht
 	return 0, nil, nil, 0, errors.New("unreachable")
 }
 
+func newTrace() (string, string) {
+	b := make([]byte, 24)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b[:16]), hex.EncodeToString(b[16:])
+}
+
 // request sends one request and captures the SQL it caused.
 func (r *Runner) request(ctx context.Context, req *inputs.Request, k int) (analyze.Sample, []byte, http.Header) {
 	s := analyze.Sample{K: k}
-	m0, err := r.db.Mark(ctx)
+	trace := ""
+	if r.cfg.TraceOn() {
+		var span string
+		trace, span = newTrace()
+		if req.Header == nil {
+			req.Header = map[string]string{}
+		}
+		req.Header["traceparent"] = "00-" + trace + "-" + span + "-01"
+	}
+	m0, err := r.cap.Mark(ctx)
 	if err != nil {
 		s.Err = err.Error()
 		return s, nil, nil
@@ -252,28 +310,42 @@ func (r *Runner) request(ctx context.Context, req *inputs.Request, k int) (analy
 		return s, nil, nil
 	}
 	settle := r.cfg.settle()
-	if strings.HasPrefix(r.db.LogSource(), "docker") && settle < 150*time.Millisecond {
+	if strings.HasPrefix(r.cap.LogSource(), "docker") && settle < 150*time.Millisecond {
 		settle = 150 * time.Millisecond // docker log stream lag
 	}
 	time.Sleep(settle)
-	m1, _ := r.db.Mark(ctx)
-	stmts, err := r.db.Window(ctx, m0, m1)
+	m1, _ := r.cap.Mark(ctx)
+	stmts, err := r.cap.Window(ctx, m0, m1)
 	if err != nil {
 		s.Err = "capture: " + err.Error()
 	}
-	if len(r.bg) > 0 { // quiet check: drop statements that background traffic produces
-		kept := stmts[:0]
-		for _, st := range stmts {
-			if _, isBG := r.bg[st.Fingerprint]; isBG {
-				s.Noise++
-				continue
-			}
-			kept = append(kept, st)
-		}
-		stmts = kept
-	}
-	s.Status, s.Ms, s.Bytes, s.Stmts, s.NStmts = status, ms, len(body), stmts, len(stmts)
+	stmts = r.attribute(stmts, trace, &s)
+	s.Status, s.Ms, s.Bytes, s.Stmts, s.NStmts, s.Page = status, ms, len(body), stmts, len(stmts), req.Page
 	return s, body, hdr
+}
+
+// attribute keeps the statements this request caused: SQL tagged with our
+// trace id (sqlcommenter) is ours, SQL tagged with another id isn't, and
+// untagged SQL is ours unless its shape was seen while idle.
+func (r *Runner) attribute(stmts []analyze.Stmt, trace string, s *analyze.Sample) []analyze.Stmt {
+	kept := stmts[:0]
+	for _, st := range stmts {
+		if st.TraceID != "" && trace != "" {
+			if st.TraceID == trace {
+				r.corr = true
+				kept = append(kept, st)
+			} else {
+				s.Noise++
+			}
+			continue
+		}
+		if _, isBG := r.bg[st.Fingerprint]; isBG && len(r.bg) > 0 {
+			s.Noise++
+			continue
+		}
+		kept = append(kept, st)
+	}
+	return kept
 }
 
 var idKeys = regexp.MustCompile(`(?i)^(id|_id|uuid|\w+_?id)$`)
@@ -289,6 +361,13 @@ func extractID(body []byte, hdr http.Header) string {
 			}
 		}
 		if m, ok := v.(map[string]any); ok {
+			if d, ok := m["data"].(map[string]any); ok && len(d) == 1 { // GraphQL: {"data":{"createUser":{"id":…}}}
+				for _, x := range d {
+					if obj, ok := x.(map[string]any); ok && obj["id"] != nil {
+						return jsonScalar(obj["id"])
+					}
+				}
+			}
 			for k, x := range m {
 				if idKeys.MatchString(k) && strings.HasSuffix(strings.ToLower(k), "id") {
 					return jsonScalar(x)
@@ -326,21 +405,23 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 	writes = spec.OrderWrites(writes)
 	r.log("%d operations selected (%d read, %d write), %d skipped", len(ops), len(reads), len(writes), len(skipped))
 
-	mk := pending{DBURL: redactURL(c.DB.URL), Capture: true}
+	mk := pending{DBURL: redactURL(c.DB.URL), Capture: !c.Proxy()}
 	writeMarker(mk)
-	if err := r.db.StartCapture(ctx); err != nil {
+	if err := r.cap.StartCapture(ctx); err != nil {
 		return nil, fmt.Errorf("start capture: %w", err)
 	}
 	captureOn := true
 	stopCapture := func() {
 		if captureOn {
-			if err := r.db.StopCapture(context.Background()); err != nil {
+			if err := r.cap.StopCapture(context.Background()); err != nil {
 				r.result.Warnings = append(r.result.Warnings, "restoring log settings failed: "+err.Error())
 			}
 			captureOn = false
 		}
 	}
 	defer stopCapture()
+	r.result.Capture = r.cap.LogSource()
+	r.result.DBTime = r.timingSource()
 
 	if n := r.idleProbe(ctx, 1500*time.Millisecond); n > 0 {
 		r.log("background SQL detected while idle (%d statements); those query shapes are excluded", n)
@@ -404,6 +485,12 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 			}
 		}
 	}
+	if c.Cache.Cold && ctx.Err() == nil {
+		r.coldPhase(ctx, results)
+	}
+	if c.Load.Enabled && ctx.Err() == nil {
+		r.loadPhase(ctx, results, ops)
+	}
 	var touched []string
 	if snapshot {
 		time.Sleep(1500 * time.Millisecond) // PG flushes table stats lazily
@@ -415,21 +502,21 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 			}
 		}
 		for _, res := range results {
-			if res.Phase != "W" {
+			if res.Phase != "W" && !c.Load.Writes {
 				continue
 			}
 			for _, s := range append(res.Samples, flatten(res.KSamples)...) {
 				for _, st := range s.Stmts {
 					if st.Kind == "insert" || st.Kind == "update" || st.Kind == "delete" {
-						if t := sqlutil.TargetTable(st.SQL); t != "" {
-							set[t] = true
+						if st.Target != "" {
+							set[st.Target] = true
 						}
 					}
 				}
 			}
 		}
 		for t := range set {
-			if r.tables[t] != nil {
+			if tb := r.tables[t]; tb != nil && tb.HasData() {
 				touched = append(touched, t)
 			}
 		}
@@ -446,6 +533,9 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 			break
 		}
 		r.replay(ctx, res)
+	}
+	if c.PerTable() && len(r.nsSteps) > 0 && ctx.Err() == nil {
+		r.perTable(ctx, results)
 	}
 
 	if snapshot {
@@ -466,41 +556,7 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 		}
 	}
 
-	unindexed := map[string][]string{}
-	for _, f := range r.fks {
-		if f.Declared && !f.Indexed {
-			unindexed[f.Parent] = append(unindexed[f.Parent], f.Child+"."+f.ChildCol)
-		}
-	}
-	tableRows := map[string]float64{}
-	for n, t := range r.tables {
-		tableRows[t.Name] = t.Rows
-		tableRows[n] = t.Rows
-	}
-	colSet := map[string]map[string]bool{}
-	for n, t := range r.tables {
-		colSet[n] = map[string]bool{}
-		for _, cn := range t.Cols {
-			colSet[n][strings.ToLower(cn)] = true
-		}
-	}
-	idxSet := map[string]map[string][]string{}
-	for n, t := range r.tables {
-		idxSet[n] = t.Indexes
-	}
-	adviseCtx := analyze.AdviseCtx{Dialect: r.db.Info().Dialect, TableRows: tableRows, UnindexedFK: unindexed, Cols: colSet, Indexes: idxSet}
-	for _, res := range results {
-		for _, q := range res.Queries {
-			if q.Kind == "delete" || q.Kind == "update" {
-				if t := sqlutil.TargetTable(q.SQL); t != "" && len(unindexed[t]) > 0 {
-					q.Notes = append(q.Notes, "fk-child:"+strings.SplitN(unindexed[t][0], ".", 2)[0])
-				}
-			}
-			analyze.AnalyzeQuery(q, tableRows)
-		}
-		analyze.AnalyzeRoute(res, c.Thresholds.P95Ms, c.Thresholds.MaxQueries)
-		analyze.Advise(res, adviseCtx)
-	}
+	r.analyzeAll(ctx, results)
 	if len(r.bg) > 0 {
 		var shapes []string
 		for _, q := range r.bg {
@@ -515,6 +571,11 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 		}
 		r.result.Warnings = append(r.result.Warnings, fmt.Sprintf("background SQL from other clients/jobs was detected; %d statement(s) of these shapes were excluded from endpoint numbers: %s", noise, strings.Join(shapes, " | ")))
 	}
+	r.result.Correlated = r.corr
+	r.result.Cache = "warm"
+	if c.Cache.Cold {
+		r.result.Cache = "warm+cold"
+	}
 	r.result.Ops = results
 	r.result.Unresolved = r.res.Unresolved
 	r.result.Seconds = time.Since(r.result.Started).Seconds()
@@ -524,11 +585,58 @@ func (r *Runner) Run(ctx context.Context) (*Result, error) {
 	return r.result, nil
 }
 
+func (r *Runner) timingSource() string {
+	if ts, ok := r.cap.(interface{ TimingSource() string }); ok {
+		return ts.TimingSource()
+	}
+	if r.db.Info().Dialect == "postgres" {
+		return "server log"
+	}
+	return "replay estimate"
+}
+
+// analyzeAll turns measurements into verdicts and verifies index advice.
+func (r *Runner) analyzeAll(ctx context.Context, results []*analyze.OpResult) {
+	c := r.cfg
+	unindexed := map[string][]string{}
+	for _, f := range r.fks {
+		if f.Declared && !f.Indexed {
+			unindexed[f.Parent] = append(unindexed[f.Parent], f.Child+"|"+strings.Join(f.ChildCols, ","))
+		}
+	}
+	tableRows := map[string]float64{}
+	colSet := map[string]map[string]bool{}
+	idxSet := map[string]map[string][]string{}
+	for n, t := range r.tables {
+		tableRows[n] = t.Rows
+		colSet[n] = map[string]bool{}
+		for _, cn := range t.Cols {
+			colSet[n][strings.ToLower(cn)] = true
+		}
+		idxSet[n] = t.Indexes
+	}
+	adviseCtx := analyze.AdviseCtx{Dialect: r.db.Info().Dialect, TableRows: tableRows, UnindexedFK: unindexed, Cols: colSet, Indexes: idxSet}
+	for _, res := range results {
+		for _, q := range res.Queries {
+			if (q.Kind == "delete" || q.Kind == "update") && q.Example.Target != "" && len(unindexed[q.Example.Target]) > 0 {
+				child, _, _ := strings.Cut(unindexed[q.Example.Target][0], "|")
+				q.Notes = append(q.Notes, "fk-child:"+child)
+			}
+			analyze.AnalyzeQuery(q, tableRows)
+		}
+		analyze.AnalyzeRoute(res, c.Thresholds.P95Ms, c.Thresholds.MaxQueries)
+		analyze.Advise(res, adviseCtx)
+	}
+	if c.Verify() {
+		r.verifyAdvice(ctx, results)
+	}
+}
+
 func (r *Runner) verifyRestore(ts []*db.Table) bool {
 	ok := true
 	for _, t := range ts {
-		a, _ := r.db.FirstValues(context.Background(), fmt.Sprintf("SELECT COUNT(*) FROM %s", t.Name))
-		b, _ := r.db.FirstValues(context.Background(), fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", db.SnapNS, t.Name))
+		a, _ := r.db.FirstValues(context.Background(), fmt.Sprintf("SELECT COUNT(*) FROM %s", t.SQL))
+		b, _ := r.db.FirstValues(context.Background(), fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", db.SnapNS, r.db.Quote(t.NSName())))
 		if len(a) == 0 || len(b) == 0 || a[0] != b[0] {
 			ok = false
 		}
@@ -546,8 +654,13 @@ func truncateSQL(s string, n int) string {
 
 func flatten(m map[int][]analyze.Sample) []analyze.Sample {
 	var out []analyze.Sample
-	for _, v := range m {
-		out = append(out, v...)
+	ks := make([]int, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Ints(ks)
+	for _, k := range ks {
+		out = append(out, m[k]...)
 	}
 	return out
 }
@@ -555,7 +668,7 @@ func flatten(m map[int][]analyze.Sample) []analyze.Sample {
 func nsNames(steps []float64) []string {
 	var out []string
 	for _, s := range steps {
-		out = append(out, db.NSName(s))
+		out = append(out, db.NSName(s), db.PTName(s))
 	}
 	return out
 }
@@ -567,7 +680,8 @@ func redactURL(raw string) string {
 	}
 	if u.User != nil {
 		if _, has := u.User.Password(); has {
-			u.User = url.UserPassword(u.User.Username(), "***")
+			u.User = url.UserPassword(u.User.Username(), "REDACTEDPW")
+			return strings.Replace(u.String(), "REDACTEDPW", "***", 1)
 		}
 	}
 	return u.String()
@@ -590,6 +704,14 @@ func (r *Runner) runOpWith(ctx context.Context, o *spec.Operation, overrides fun
 	if ki != nil {
 		res.KParam = ki.Name
 	}
+	observe := func(req *inputs.Request, s analyze.Sample, body []byte, hdr http.Header) {
+		r.res.Observe(o, req, s.Status, body, hdr)
+		if o.Method == "POST" && s.Status < 300 && s.Status > 0 {
+			if id := extractID(body, hdr); id != "" {
+				r.created[o.Path] = append(r.created[o.Path], id)
+			}
+		}
+	}
 	n := c.Run.Warmup + c.Run.Iterations
 	for i := 0; i < n && ctx.Err() == nil; i++ {
 		req, err := r.res.Build(ctx, o, i, -1, ki, overrides(i))
@@ -598,37 +720,56 @@ func (r *Runner) runOpWith(ctx context.Context, o *spec.Operation, overrides fun
 			break
 		}
 		s, body, hdr := r.request(ctx, req, 0)
-		if o.Method == "POST" && s.Status < 300 && s.Status > 0 {
-			if id := extractID(body, hdr); id != "" {
-				coll := o.Path
-				r.created[coll] = append(r.created[coll], id)
-			}
+		observe(req, s, body, hdr)
+		if s.Status >= 400 && c.Verbose && i == 0 {
+			r.log("    %s %s → %d: %s", o.Method, o.Path, s.Status, truncateSQL(string(body), 200))
 		}
 		if i >= c.Run.Warmup {
 			res.Samples = append(res.Samples, s)
 		}
 	}
+	res.Pages = r.res.Pages(o)
 	if ki != nil && !c.Scale.Disabled {
 		iter := n
+		sample := func(k int) bool {
+			iter++
+			req, err := r.res.Build(ctx, o, iter, k, ki, overrides(iter))
+			if err != nil {
+				return false
+			}
+			s, body, hdr := r.request(ctx, req, k)
+			observe(req, s, body, hdr)
+			res.KSamples[k] = append(res.KSamples[k], s)
+			return true
+		}
+		var ks []int
 		for _, k := range c.Scale.KSteps {
 			if k < ki.Min || k > ki.Max || ctx.Err() != nil {
 				continue
 			}
-			for j := 0; j < c.Run.KIterations+1; j++ {
-				iter++
-				req, err := r.res.Build(ctx, o, iter, k, ki, overrides(iter))
-				if err != nil {
+			iter++
+			if req, err := r.res.Build(ctx, o, iter, k, ki, overrides(iter)); err == nil { // warm this size once
+				s, body, hdr := r.request(ctx, req, k)
+				observe(req, s, body, hdr)
+			}
+			ks = append(ks, k)
+			for j := 0; j < c.Run.KIterations; j++ {
+				if !sample(k) {
 					break
 				}
-				s, body, hdr := r.request(ctx, req, k)
-				if o.Method == "POST" && s.Status < 300 && s.Status > 0 {
-					if id := extractID(body, hdr); id != "" {
-						r.created[o.Path] = append(r.created[o.Path], id)
-					}
-				}
-				if j > 0 {
-					res.KSamples[k] = append(res.KSamples[k], s)
-				}
+			}
+		}
+		// keep sampling until the app-time slope's 95% CI is tight
+		for round := c.Run.KIterations; round < c.Scale.MaxRepeats && ctx.Err() == nil; round++ {
+			s, hw, significant := appSlope(res)
+			if !significant || hw <= c.Scale.CITarget {
+				break
+			}
+			if round == c.Run.KIterations {
+				r.log("    k-axis slope %s: sampling more for a tighter interval", analyze.FmtSlope(s, hw))
+			}
+			for _, k := range ks {
+				sample(k)
 			}
 		}
 	}
@@ -650,34 +791,56 @@ func medianStmts(ss []analyze.Sample) int {
 	return int(analyze.Median(v))
 }
 
-// runWrite runs a write op with lifecycle ID chaining.
+// runWrite runs a write op with lifecycle ID chaining: IDs come from OpenAPI
+// links when the spec declares them, else from the collection's POST.
 func (r *Runner) runWrite(ctx context.Context, o *spec.Operation, all []*spec.Operation) *analyze.OpResult {
 	param := spec.LastParam(o.Path)
-	if o.Method == "POST" || param == "" {
+	if o.Method == "POST" || param == "" || o.Protocol != "" && o.Protocol != "http" {
+		return r.runOp(ctx, o)
+	}
+	if o.Method != "DELETE" && r.res.HasLinks(o) { // PUT/PATCH reuse linked IDs
 		return r.runOp(ctx, o)
 	}
 	coll := spec.CollectionPath(o.Path)
-	ids := r.created[coll]
+	src, srcParam := r.res.LinkSource(o)
+	current := func() []string {
+		if src != nil {
+			var out []string
+			for _, v := range r.res.Linked(o.ID, srcParam) {
+				out = append(out, fmt.Sprint(v))
+			}
+			return out
+		}
+		return r.created[coll]
+	}
+	ids := current()
 	need := r.cfg.Run.Warmup + r.cfg.Run.Iterations + 8
 	if o.Method == "DELETE" && len(ids) < need {
-		// pre-create resources (untimed) through the collection's POST
-		for _, p := range all {
-			if p.Method == "POST" && p.Path == coll {
-				for j := 0; len(r.created[coll]) < need && j < need*2; j++ {
-					req, err := r.res.Build(ctx, p, 50000+j, -1, nil, nil)
-					if err != nil {
-						break
-					}
-					status, body, hdr, _, err := r.send(ctx, req)
-					if err == nil && status < 300 {
-						if id := extractID(body, hdr); id != "" {
-							r.created[coll] = append(r.created[coll], id)
-						}
+		// pre-create resources (untimed) through the op that links here, or the collection's POST
+		creator := src
+		if creator == nil {
+			for _, p := range all {
+				if p.Method == "POST" && p.Path == coll {
+					creator = p
+				}
+			}
+		}
+		if creator != nil {
+			for j := 0; len(current()) < need && j < need*2; j++ {
+				req, err := r.res.Build(ctx, creator, 50000+j, -1, nil, nil)
+				if err != nil {
+					break
+				}
+				status, body, hdr, _, err := r.send(ctx, req)
+				if err == nil && status < 300 {
+					r.res.Observe(creator, req, status, body, hdr)
+					if id := extractID(body, hdr); id != "" && src == nil {
+						r.created[coll] = append(r.created[coll], id)
 					}
 				}
 			}
 		}
-		ids = r.created[coll]
+		ids = current()
 	}
 	if len(ids) == 0 {
 		if o.Method == "DELETE" && r.result.Snapshot == "none" {
@@ -690,7 +853,11 @@ func (r *Runner) runWrite(ctx context.Context, o *spec.Operation, all []*spec.Op
 	}
 	if o.Method == "DELETE" {
 		pool := append([]string(nil), ids...)
-		r.created[coll] = nil
+		if src != nil {
+			r.res.TakeLinked(o.ID, srcParam)
+		} else {
+			r.created[coll] = nil
+		}
 		return r.runOpWith(ctx, o, func(i int) map[string]string {
 			if i < len(pool) {
 				return map[string]string{param: pool[len(pool)-1-i]}
@@ -715,8 +882,8 @@ func (r *Runner) buildSubsets(ctx context.Context, results []*analyze.OpResult) 
 						names[t] = true
 					}
 				}
-				if st.Kind == "delete" || st.Kind == "update" {
-					dmlTargets = append(dmlTargets, sqlutil.TargetTable(st.SQL))
+				if (st.Kind == "delete" || st.Kind == "update") && st.Target != "" {
+					dmlTargets = append(dmlTargets, st.Target)
 				}
 			}
 		}
@@ -730,10 +897,10 @@ func (r *Runner) buildSubsets(ctx context.Context, results []*analyze.OpResult) 
 	for n := range names {
 		want = append(want, n)
 	}
-	scope := db.ParentClosure(want, r.tables, r.fks)
+	scope := db.ParentClosure(r.db.Info().Dialect, want, r.tables, r.fks)
 	var missing []*db.Table
 	for _, t := range scope {
-		if !r.built[t.Name] {
+		if !r.built[t.Key] {
 			missing = append(missing, t)
 		}
 	}
@@ -758,14 +925,16 @@ func (r *Runner) buildSubsets(ctx context.Context, results []*analyze.OpResult) 
 	}
 	full := map[string]float64{}
 	for _, t := range order {
-		v, _ := r.db.FirstValues(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", t.Name))
-		if len(v) > 0 {
-			var f float64
-			fmt.Sscan(v[0], &f)
-			full[t.Name] = f
-			t.Rows = f
+		if t.HasData() {
+			v, _ := r.db.FirstValues(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", t.SQL))
+			if len(v) > 0 {
+				var f float64
+				fmt.Sscan(v[0], &f)
+				full[t.Key] = f
+				t.Rows = f
+			}
 		}
-		r.built[t.Name] = true
+		r.built[t.Key] = true
 	}
 	r.counts[1] = full
 }
@@ -777,6 +946,7 @@ func (r *Runner) dropSubsets() {
 	for _, s := range r.cfg.Scale.DataSteps {
 		if s < 1 {
 			_ = r.db.DropNamespace(context.Background(), db.NSName(s))
+			_ = r.db.DropNamespace(context.Background(), db.PTName(s))
 		}
 	}
 }

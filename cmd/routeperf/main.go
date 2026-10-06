@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -20,6 +22,8 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/nazishasghar/routeperf/internal/db"
+	"github.com/nazishasghar/routeperf/internal/diff"
+	"github.com/nazishasghar/routeperf/internal/proxy"
 	"github.com/nazishasghar/routeperf/internal/report"
 	"github.com/nazishasghar/routeperf/internal/runner"
 	"github.com/nazishasghar/routeperf/internal/spec"
@@ -27,11 +31,16 @@ import (
 )
 
 type flags struct {
-	config, spec, api, dbURL, token, cookieJar, out, pgLog, planMode string
-	headers, cookies, only, exclude                                  []string
-	yes, noWrites, noScale, allowRemote, verbose, nonInter           bool
-	ci                                                               bool
-	iterations                                                       int
+	config, spec, api, dbURL, token, tokenCmd, cookieJar, out, pgLog, planMode string
+	capture, proxyListen, protocol, coldCmd, loadDur                           string
+	headers, cookies, only, exclude, dbSchemas                                 []string
+	yes, noWrites, noScale, allowRemote, verbose, nonInter                     bool
+	ci, mask, cold, load, loadWrites, noHTML, noPerTable, noVerify             bool
+	iterations                                                                 int
+	loadConc                                                                   []int
+	diffP95, diffP95Min, diffQ                                                 float64
+	diffFailOn                                                                 []string
+	diffOut                                                                    string
 }
 
 var f flags
@@ -39,10 +48,11 @@ var f flags
 func main() {
 	root := &cobra.Command{
 		Use:   "routeperf",
-		Short: "Per-route performance and Big O estimates from an OpenAPI spec + EXPLAIN ANALYZE",
-		Long: `routeperf calls every route of your API (from its Swagger/OpenAPI spec), captures the SQL
-each route runs on your local Postgres/MySQL, replays it with EXPLAIN ANALYZE on nested
-1%→100% data subsets and reports latency, DB time, queries/request and an estimated Big O.
+		Short: "Per-endpoint performance and Big O from an OpenAPI, GraphQL or gRPC API + EXPLAIN ANALYZE",
+		Long: `routeperf calls every endpoint of your API (from its OpenAPI spec, GraphQL schema or gRPC
+service), captures the SQL each one runs on Postgres/MySQL (from the server log, or through its
+wire proxy when you have no admin rights), replays it with EXPLAIN ANALYZE on 1%→100% data
+subsets and reports latency, DB time, queries/request, an estimated Big O and proven fixes.
 
 Start with:  routeperf init   →   routeperf check   →   routeperf run`,
 		Example: `  routeperf init
@@ -50,7 +60,9 @@ Start with:  routeperf init   →   routeperf check   →   routeperf run`,
   routeperf run --spec http://localhost:3000/swagger.json --api-url http://localhost:3000 \
                 --db-url postgres://me@localhost:5432/app --token "$API_TOKEN"
   routeperf run --no-writes --only tag:orders
-  routeperf run --ci -o perf-report`,
+  routeperf run --ci -o perf-report
+  routeperf run --cold --load
+  routeperf diff main/results.json pr/results.json`,
 		Version:       version.String(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -61,16 +73,22 @@ Start with:  routeperf init   →   routeperf check   →   routeperf run`,
 	}
 	pf := root.PersistentFlags()
 	pf.StringVarP(&f.config, "config", "c", defCfg, "config file (env ROUTEPERF_CONFIG)")
-	pf.StringVar(&f.spec, "spec", "", "swagger/OpenAPI URL or file")
+	pf.StringVar(&f.spec, "spec", "", "API description: OpenAPI URL/file, GraphQL endpoint or .graphql file, grpc://host:port or .proto files")
 	pf.StringVar(&f.api, "api-url", "", "API base URL")
 	pf.StringVar(&f.dbURL, "db-url", "", "database URL (postgres://… or mysql://…)")
 	pf.StringVar(&f.token, "token", "", "bearer token")
+	pf.StringVar(&f.tokenCmd, "token-cmd", "", "shell command that prints a bearer token (e.g. 'gcloud auth print-access-token'); re-run on 401")
 	pf.StringArrayVarP(&f.headers, "header", "H", nil, "custom header 'Name: value' (repeatable)")
 	pf.StringArrayVarP(&f.cookies, "cookie", "b", nil, "cookie 'name=value' (repeatable)")
 	pf.StringVar(&f.cookieJar, "cookie-jar", "", "Netscape/curl cookie file")
 	pf.StringVar(&f.pgLog, "pg-log-file", "", "Postgres stderr log path or docker:<container> (auto-detected)")
 	pf.StringVar(&f.planMode, "pg-plan-mode", "", "Postgres replay plans: auto (match the app's prepared statements) | custom | generic")
 	pf.BoolVar(&f.allowRemote, "allow-remote-db", false, "allow a non-local database (disposable test DBs only)")
+	pf.StringSliceVar(&f.dbSchemas, "db-schemas", nil, "MySQL: other databases the app reads (Postgres sees every schema)")
+	pf.StringVar(&f.capture, "capture", "", "how SQL is captured: log (server statement log; needs admin) | proxy (wire proxy; no admin rights)")
+	pf.StringVar(&f.proxyListen, "proxy-listen", "", "proxy capture: address the app connects to instead of the DB (default 127.0.0.1:6543)")
+	pf.StringVar(&f.protocol, "protocol", "", "API description: openapi | graphql | grpc (auto-detected from --spec)")
+	pf.BoolVar(&f.mask, "mask-literals", false, "replace SQL literals and parameters with ? in every report")
 	pf.BoolVar(&f.nonInter, "non-interactive", false, "never prompt")
 	pf.BoolVarP(&f.verbose, "verbose", "v", false, "verbose logs")
 
@@ -83,16 +101,39 @@ Start with:  routeperf init   →   routeperf check   →   routeperf run`,
 	runCmd.Flags().StringVarP(&f.out, "out", "o", "", "output directory (default routeperf-out)")
 	runCmd.Flags().IntVarP(&f.iterations, "iterations", "n", 0, "timed requests per operation")
 	runCmd.Flags().BoolVar(&f.ci, "ci", false, "exit 2 when any route FAILs")
+	runCmd.Flags().BoolVar(&f.cold, "cold", false, "also measure cold-cache first hits (tables evicted from the DB cache before each sample)")
+	runCmd.Flags().StringVar(&f.coldCmd, "cold-cmd", "", "shell command run before each cold sample, e.g. to drop OS caches")
+	runCmd.Flags().BoolVar(&f.load, "load", false, "also run a concurrent load test per endpoint (lock contention, pool limits)")
+	runCmd.Flags().IntSliceVar(&f.loadConc, "load-concurrency", nil, "load: concurrency levels (default 1,4,16,32)")
+	runCmd.Flags().StringVar(&f.loadDur, "load-duration", "", "load: duration per level (default 5s)")
+	runCmd.Flags().BoolVar(&f.loadWrites, "load-writes", false, "load: include POST/PUT/PATCH endpoints (data is restored afterwards)")
+	runCmd.Flags().BoolVar(&f.noHTML, "no-html", false, "don't write report.html")
+	runCmd.Flags().BoolVar(&f.noPerTable, "no-per-table", false, "skip shrinking one table at a time for multi-table queries")
+	runCmd.Flags().BoolVar(&f.noVerify, "no-verify", false, "don't prove index advice with HypoPG")
 
 	checkCmd := &cobra.Command{Use: "check", Short: "Verify spec, API, auth and database connections and say what is wrong", RunE: cmdCheck}
 	discoverCmd := &cobra.Command{Use: "discover", Short: "List operations, inputs and auth mapping without running anything heavy", RunE: cmdDiscover}
 	initCmd := &cobra.Command{Use: "init", Short: "Interactive setup: asks for spec, API, DB and auth, writes routeperf.yaml", RunE: cmdInit}
 	repairCmd := &cobra.Command{Use: "repair", Short: "Undo leftovers of an interrupted run (log settings, snapshot, subsets)", RunE: cmdRepair}
-	reportCmd := &cobra.Command{Use: "report <results.json>", Short: "Re-render report.md from results.json", Args: cobra.ExactArgs(1), RunE: cmdReport}
+	reportCmd := &cobra.Command{Use: "report <results.json>", Short: "Re-render report.md and report.html from results.json", Args: cobra.ExactArgs(1), RunE: cmdReport}
+	proxyCmd := &cobra.Command{Use: "proxy", Short: "Run the SQL capture proxy: point the app's DB URL at it, then `routeperf run --capture proxy`",
+		Long: `routeperf proxy sits between your app and its database (Postgres or MySQL wire protocol) and records
+the SQL the app sends. It needs no admin rights and no access to server logs, so it works with RDS,
+Cloud SQL and shared dev servers. Start it, restart the app with the printed database URL, then run
+routeperf with --capture proxy in another terminal.`, RunE: cmdProxy}
+	loadCmd := &cobra.Command{Use: "load", Short: "Concurrent load test per endpoint: throughput, latency, DB connections and lock waits", RunE: cmdLoad}
+	loadCmd.Flags().AddFlagSet(runCmd.Flags())
+	diffCmd := &cobra.Command{Use: "diff <base.json> <new.json>", Short: "Compare two runs; exit 2 when an endpoint got worse (Big O, p95, queries, N+1, status)",
+		Example: "  routeperf diff main/results.json pr/results.json\n  routeperf diff base.json new.json --p95-pct 10 -o diff.md", Args: cobra.ExactArgs(2), RunE: cmdDiff}
+	diffCmd.Flags().Float64Var(&f.diffP95, "p95-pct", 20, "fail when p95 grows by at least this percent")
+	diffCmd.Flags().Float64Var(&f.diffP95Min, "p95-min-ms", 5, "ignore p95 changes smaller than this many ms")
+	diffCmd.Flags().Float64Var(&f.diffQ, "queries", 1, "fail when queries/request grow by at least this much")
+	diffCmd.Flags().StringSliceVar(&f.diffFailOn, "fail-on", []string{"bigo", "p95", "queries", "nplusone", "status"}, "regressions that fail: bigo,p95,queries,nplusone,status,missing")
+	diffCmd.Flags().StringVarP(&f.diffOut, "out", "o", "", "also write a Markdown summary (for a PR comment)")
 	versionCmd := &cobra.Command{Use: "version", Short: "Print the routeperf version", Run: func(*cobra.Command, []string) {
 		fmt.Println("routeperf", version.String())
 	}}
-	root.AddCommand(runCmd, checkCmd, discoverCmd, initCmd, repairCmd, reportCmd, versionCmd)
+	root.AddCommand(runCmd, proxyCmd, loadCmd, checkCmd, discoverCmd, initCmd, repairCmd, reportCmd, diffCmd, versionCmd)
 
 	report.Color = isTTY(os.Stdout)
 	if err := root.Execute(); err != nil {
@@ -122,6 +163,54 @@ func loadConfig(ask bool) (*runner.Config, error) {
 	}
 	if f.token != "" {
 		cfg.Auth.Bearer = f.token
+	}
+	if f.tokenCmd != "" {
+		cfg.Auth.BearerCommand = f.tokenCmd
+	}
+	if len(f.dbSchemas) > 0 {
+		cfg.DB.Schemas = f.dbSchemas
+	}
+	if f.capture != "" {
+		cfg.Capture.Mode = f.capture
+	}
+	if f.proxyListen != "" {
+		cfg.Capture.ProxyListen = f.proxyListen
+	}
+	if f.protocol != "" {
+		cfg.API.Protocol = f.protocol
+	}
+	if f.mask {
+		cfg.Report.MaskLiterals = true
+	}
+	if f.cold {
+		cfg.Cache.Cold = true
+	}
+	if f.coldCmd != "" {
+		cfg.Cache.Cold, cfg.Cache.ColdCmd = true, f.coldCmd
+	}
+	if f.load {
+		cfg.Load.Enabled = true
+	}
+	if len(f.loadConc) > 0 {
+		cfg.Load.Concurrency = f.loadConc
+	}
+	if f.loadDur != "" {
+		cfg.Load.Duration = f.loadDur
+	}
+	if f.loadWrites {
+		cfg.Load.Writes = true
+	}
+	if f.noHTML {
+		no := false
+		cfg.Report.HTML = &no
+	}
+	if f.noPerTable {
+		no := false
+		cfg.Scale.PerTable = &no
+	}
+	if f.noVerify {
+		no := false
+		cfg.Advice.Verify = &no
 	}
 	if f.cookieJar != "" {
 		cfg.Auth.CookieJar = f.cookieJar
@@ -198,7 +287,7 @@ func loadConfig(ask bool) (*runner.Config, error) {
 
 func hasAuth(c *runner.Config) bool {
 	a := c.Auth
-	return a.Bearer != "" || len(a.Headers) > 0 || len(a.Cookies) > 0 || a.CookieJar != "" || len(a.Query) > 0 || a.OAuth2 != nil || a.Login != nil
+	return a.Bearer != "" || a.BearerCommand != "" || len(a.Headers) > 0 || len(a.Cookies) > 0 || a.CookieJar != "" || len(a.Query) > 0 || a.OAuth2 != nil || a.Login != nil
 }
 
 func ctxWithSignals() (context.Context, context.CancelFunc) {
@@ -241,6 +330,26 @@ func cmdRun(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	return run(cfg)
+}
+
+// cmdLoad runs only the concurrent load test (no data-scale experiments).
+func cmdLoad(cmd *cobra.Command, _ []string) error {
+	cfg, err := loadConfig(true)
+	if err != nil {
+		return err
+	}
+	cfg.Load.Enabled, cfg.Scale.Disabled = true, true
+	if cfg.Run.Iterations > 3 && f.iterations == 0 {
+		cfg.Run.Iterations, cfg.Run.Warmup = 3, 1
+	}
+	if !cfg.Load.Writes && !f.loadWrites {
+		cfg.Run.Methods = []string{"GET", "HEAD"}
+	}
+	return run(cfg)
+}
+
+func run(cfg *runner.Config) error {
 	ctx, cancel := ctxWithSignals()
 	defer cancel()
 	r := runner.New(cfg, logf)
@@ -266,8 +375,11 @@ func cmdRun(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	if cfg.Report.MaskLiterals {
+		report.MaskLiterals(res)
+	}
 	report.Terminal(os.Stdout, res)
-	files, err := report.WriteAll(cfg.Out, res)
+	files, err := report.WriteAll(cfg.Out, res, cfg.HTMLReport())
 	if err != nil {
 		return err
 	}
@@ -317,12 +429,91 @@ func cmdReport(cmd *cobra.Command, args []string) error {
 	if err := json.Unmarshal(b, &res); err != nil {
 		return err
 	}
+	if f.mask {
+		report.MaskLiterals(&res)
+	}
 	report.Terminal(os.Stdout, &res)
-	out := strings.TrimSuffix(args[0], ".json") + ".md"
-	if err := report.WriteMarkdown(out, &res); err != nil {
+	dir := filepath.Dir(args[0])
+	base := strings.TrimSuffix(filepath.Base(args[0]), ".json")
+	md, ht := filepath.Join(dir, strings.Replace(base, "results", "report", 1)+".md"), filepath.Join(dir, strings.Replace(base, "results", "report", 1)+".html")
+	if err := report.WriteMarkdown(md, &res); err != nil {
 		return err
 	}
-	fmt.Println("\nwrote", out)
+	if err := report.WriteHTML(ht, &res); err != nil {
+		return err
+	}
+	fmt.Println("\nwrote", md, "and", ht)
+	return nil
+}
+
+func cmdProxy(cmd *cobra.Command, _ []string) error {
+	cfg, err := runner.LoadConfig(f.config)
+	if err != nil {
+		return err
+	}
+	if f.dbURL != "" {
+		cfg.DB.URL = f.dbURL
+	}
+	if f.proxyListen != "" {
+		cfg.Capture.ProxyListen = f.proxyListen
+	}
+	cfg.Defaults()
+	if cfg.DB.URL == "" {
+		return fmt.Errorf("--db-url is required (the real database the proxy forwards to)")
+	}
+	px, err := proxy.New(cfg.DB.URL, cfg.Capture.ProxyListen, func() map[string]*db.Table { return nil })
+	if err != nil {
+		return err
+	}
+	defer px.Close()
+	control := proxy.ControlAddr(cfg.Capture.ProxyListen)
+	srv, err := px.ServeControl(control)
+	if err != nil {
+		return err
+	}
+	defer srv.Close()
+	fmt.Fprintf(os.Stderr, "routeperf proxy listening on %s (control %s)\n", cfg.Capture.ProxyListen, control)
+	fmt.Fprintf(os.Stderr, "point the app at:  %s  (same user and password)\n", redactPassword(px.ProxyURL()))
+	fmt.Fprintln(os.Stderr, "then run:          routeperf run --capture proxy   (Ctrl-C here to stop)")
+	ctx, cancel := ctxWithSignals()
+	defer cancel()
+	<-ctx.Done()
+	return nil
+}
+
+func redactPassword(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return raw
+	}
+	if _, ok := u.User.Password(); ok {
+		u.User = url.UserPassword(u.User.Username(), "REDACTEDPW")
+		return strings.Replace(u.String(), "REDACTEDPW", "***", 1)
+	}
+	return u.String()
+}
+
+func cmdDiff(cmd *cobra.Command, args []string) error {
+	o := diff.DefaultOptions()
+	o.P95Pct, o.P95MinMs, o.QueriesAbs = f.diffP95, f.diffP95Min, f.diffQ
+	o.FailOn = map[string]bool{}
+	for _, k := range f.diffFailOn {
+		o.FailOn[strings.ToLower(strings.TrimSpace(k))] = true
+	}
+	rep, err := diff.Compare(args[0], args[1], o)
+	if err != nil {
+		return err
+	}
+	rep.Print(os.Stdout)
+	if f.diffOut != "" {
+		if err := os.WriteFile(f.diffOut, []byte(rep.Markdown()), 0o644); err != nil {
+			return err
+		}
+		fmt.Println("wrote", f.diffOut)
+	}
+	if rep.Failed {
+		os.Exit(2)
+	}
 	return nil
 }
 
@@ -332,18 +523,20 @@ func cmdRepair(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	ctx := context.Background()
-	d, err := db.Open(ctx, cfg.DB.URL, db.Options{PGLogFile: cfg.Capture.PGLogFile})
+	d, err := db.Open(ctx, cfg.DB.URL, db.Options{PGLogFile: cfg.Capture.PGLogFile, Schemas: cfg.DB.Schemas, NoSilence: cfg.Proxy()})
 	if err != nil {
 		return err
 	}
 	defer d.Close()
-	if err := d.StartCapture(ctx); err == nil { // records current values, then resets to them
-		_ = d.StopCapture(ctx)
-	}
 	if d.Info().Dialect == "postgres" {
 		for _, p := range []string{"log_min_duration_statement", "log_parameter_max_length", "log_line_prefix"} {
 			fmt.Println("note: if routeperf crashed mid-run, reset", p, "with: ALTER SYSTEM RESET", p+"; SELECT pg_reload_conf();")
 		}
+	}
+	if cfg.Proxy() {
+		fmt.Println("proxy capture changes no log settings; checking for leftover data copies only")
+	} else if err := d.StartCapture(ctx); err == nil {
+		_ = d.StopCapture(ctx)
 	}
 	if d.HasSnapshot(ctx) {
 		tables, err := d.Tables(ctx)
@@ -362,6 +555,7 @@ func cmdRepair(cmd *cobra.Command, _ []string) error {
 	}
 	for _, s := range []float64{0.01, 0.03, 0.1, 0.3} {
 		_ = d.DropNamespace(ctx, db.NSName(s))
+		_ = d.DropNamespace(ctx, db.PTName(s))
 	}
 	_ = os.Remove(".routeperf/pending.json")
 	fmt.Println("repair done")

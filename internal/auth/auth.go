@@ -14,7 +14,9 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,13 +46,14 @@ type Login struct {
 }
 
 type Config struct {
-	Bearer    string            `yaml:"bearer"`
-	Headers   map[string]string `yaml:"headers"`
-	Cookies   map[string]string `yaml:"cookies"`
-	CookieJar string            `yaml:"cookie_jar"`
-	Query     map[string]string `yaml:"query"`
-	OAuth2    *OAuth2CC         `yaml:"oauth2_client_credentials"`
-	Login     *Login            `yaml:"login"`
+	Bearer        string            `yaml:"bearer"`
+	BearerCommand string            `yaml:"bearer_command,omitempty"` // shell command printing a token (e.g. gcloud auth print-access-token)
+	Headers       map[string]string `yaml:"headers"`
+	Cookies       map[string]string `yaml:"cookies"`
+	CookieJar     string            `yaml:"cookie_jar"`
+	Query         map[string]string `yaml:"query"`
+	OAuth2        *OAuth2CC         `yaml:"oauth2_client_credentials"`
+	Login         *Login            `yaml:"login"`
 }
 
 type Manager struct {
@@ -69,7 +72,9 @@ func New(cfg Config, baseURL string, timeout time.Duration) (*Manager, error) {
 		return nil, err
 	}
 	jar, _ := cookiejar.New(nil)
-	m := &Manager{cfg: cfg, base: base, jar: jar, Client: &http.Client{Jar: jar, Timeout: timeout}}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns, tr.MaxIdleConnsPerHost = 256, 128 // load mode runs many clients at once
+	m := &Manager{cfg: cfg, base: base, jar: jar, Client: &http.Client{Jar: jar, Timeout: timeout, Transport: tr}}
 	var cs []*http.Cookie
 	for k, v := range cfg.Cookies {
 		cs = append(cs, &http.Cookie{Name: k, Value: v, Path: "/"})
@@ -123,8 +128,14 @@ func (m *Manager) resolve(p string) string {
 	return u.String()
 }
 
-// Init performs OAuth2 / login flows (outside any timed section).
+// Init performs OAuth2 / login flows and token commands (outside any timed
+// section).
 func (m *Manager) Init(ctx context.Context) error {
+	if m.cfg.BearerCommand != "" {
+		if err := m.tokenCommand(ctx); err != nil {
+			return fmt.Errorf("bearer_command: %w", err)
+		}
+	}
 	if m.cfg.OAuth2 != nil {
 		if err := m.oauth(ctx); err != nil {
 			return fmt.Errorf("oauth2 client credentials: %w", err)
@@ -212,9 +223,37 @@ func (m *Manager) login(ctx context.Context) error {
 	return nil
 }
 
+// tokenCommand runs bearer_command and uses its trimmed output as the token.
+func (m *Manager) tokenCommand(ctx context.Context) error {
+	cctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	sh, flag := "sh", "-c"
+	if runtime.GOOS == "windows" {
+		sh, flag = "cmd", "/C"
+	}
+	cmd := exec.CommandContext(cctx, sh, flag, m.cfg.BearerCommand)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, truncate(strings.TrimSpace(stderr.String()), 200))
+	}
+	tok := strings.TrimSpace(string(out))
+	if i := strings.LastIndex(tok, "\n"); i >= 0 { // tools may print notices before the token
+		tok = strings.TrimSpace(tok[i+1:])
+	}
+	if tok == "" {
+		return fmt.Errorf("command printed no token")
+	}
+	m.mu.Lock()
+	m.token = tok
+	m.mu.Unlock()
+	return nil
+}
+
 // Refresh re-runs dynamic flows after a 401 (or configured status).
 func (m *Manager) Refresh(ctx context.Context, status int) bool {
-	if m.cfg.OAuth2 == nil && m.cfg.Login == nil {
+	if m.cfg.OAuth2 == nil && m.cfg.Login == nil && m.cfg.BearerCommand == "" {
 		return false
 	}
 	if m.cfg.Login != nil && len(m.cfg.Login.RefreshOn) > 0 {
@@ -229,6 +268,21 @@ func (m *Manager) Refresh(ctx context.Context, status int) bool {
 		return false
 	}
 	return m.Init(ctx) == nil
+}
+
+// Bearer returns the current bearer token ("" if none).
+func (m *Manager) Bearer() string { return m.bearer() }
+
+// HeaderMap returns the configured custom headers.
+func (m *Manager) HeaderMap() map[string]string { return m.cfg.Headers }
+
+// CookieHeader renders the jar's cookies for the API (for non-HTTP transports).
+func (m *Manager) CookieHeader() string {
+	var parts []string
+	for _, c := range m.jar.Cookies(m.base) {
+		parts = append(parts, c.Name+"="+c.Value)
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (m *Manager) bearer() string {
@@ -336,6 +390,7 @@ func (m *Manager) Secrets() []string {
 	}
 	add(m.cfg.Bearer)
 	add(m.bearer())
+	add(m.token)
 	for _, v := range m.cfg.Headers {
 		add(v)
 	}

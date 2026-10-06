@@ -63,7 +63,8 @@ type Fit struct {
 	B          float64            `json:"coef"`
 	R2         float64            `json:"r2"`
 	NRMSE      float64            `json:"nrmse"`
-	Slope      float64            `json:"slope"` // log-log exponent
+	Slope      float64            `json:"slope"`    // log-log exponent
+	SlopeCI    float64            `json:"slope_ci"` // 95% half-width of Slope
 	Points     int                `json:"points"`
 	Decades    float64            `json:"decades"`
 	SlopeAgree bool               `json:"slope_agrees"`
@@ -77,6 +78,7 @@ func (f Fit) Predict(x float64) float64 { return f.A + f.B*classFn(f.Class, x) }
 // FitCurve picks the simplest class whose normalized RMS error is within 10%
 // of the best candidate. Points are aggregated (median) per distinct X.
 func FitCurve(pts []Point, maxClass Class) Fit {
+	raw := pts
 	pts = medianByX(pts)
 	f := Fit{Points: len(pts), All: map[string]float64{}}
 	if len(pts) < 3 {
@@ -140,6 +142,17 @@ func FitCurve(pts []Point, maxClass Class) Fit {
 		f.R2 = 1
 	}
 	f.Slope = LogLogSlope(pts, f.A)
+	f.SlopeCI = math.Inf(1)
+	var shifted []Point
+	for _, p := range raw {
+		shifted = append(shifted, Point{p.X, p.Y - f.A})
+	}
+	if s, hw, ok := SlopeCI(shifted); ok {
+		f.Slope, f.SlopeCI = s, hw
+	}
+	if math.IsInf(f.SlopeCI, 0) {
+		f.SlopeCI = 9.99
+	}
 	f.SlopeAgree = slopeAgrees(f.Slope, chosen.c)
 	f.OK = true
 	return f

@@ -3,6 +3,7 @@ package db
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,11 +33,12 @@ type pg struct {
 	opt     Options
 	logPath string
 	prev    map[string]*string // auto.conf values before capture (nil = unset)
-	major   int
-	path    string // search_path
+	path    string             // search_path
 	raw     string
 	stream  *exec.Cmd // docker logs -f, when the server runs in a container
 	port    string
+	cat     map[string]*Table
+	parts   map[string]string // partition name → top-level table key
 }
 
 var pgCaptureParams = map[string]string{
@@ -51,9 +54,11 @@ func openPG(ctx context.Context, raw string, u *url.URL, opt Options) (DB, error
 	}
 	cfg.ConnConfig.RuntimeParams["application_name"] = "routeperf"
 	cfg.MaxConns = 4
-	cfg.AfterConnect = func(ctx context.Context, c *pgx.Conn) error {
-		_, err := c.Exec(ctx, "SET log_min_duration_statement = -1")
-		return err
+	if !opt.NoSilence {
+		cfg.AfterConnect = func(ctx context.Context, c *pgx.Conn) error {
+			_, err := c.Exec(ctx, "SET log_min_duration_statement = -1")
+			return err
+		}
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -66,17 +71,19 @@ func openPG(ctx context.Context, raw string, u *url.URL, opt Options) (DB, error
 		pool.Close()
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
-	if _, err := ex.Exec(ctx, "SET log_min_duration_statement = -1"); err != nil {
-		return nil, fmt.Errorf("routeperf needs a superuser (to silence its own statements in the log): %w", err)
+	if !opt.NoSilence {
+		if _, err := ex.Exec(ctx, "SET log_min_duration_statement = -1"); err != nil {
+			return nil, fmt.Errorf("routeperf needs a superuser (to silence its own statements in the log); use --capture proxy without one: %w", err)
+		}
 	}
-	p := &pg{pool: pool, ex: ex, opt: opt, raw: raw, port: u.Port()}
+	p := &pg{pool: pool, ex: ex, opt: opt, raw: raw, port: u.Port(), cat: map[string]*Table{}, parts: map[string]string{}}
 	if p.port == "" {
 		p.port = "5432"
 	}
 	var ver string
 	var super bool
 	err = pool.QueryRow(ctx, `SELECT current_setting('server_version'), current_setting('server_version_num')::int/10000, r.rolsuper, current_database(), current_setting('search_path')
-		FROM pg_roles r WHERE r.rolname = current_user`).Scan(&ver, &p.major, &super, &p.info.Database, &p.path)
+		FROM pg_roles r WHERE r.rolname = current_user`).Scan(&ver, &p.info.Major, &super, &p.info.Database, &p.path)
 	if err != nil {
 		return nil, err
 	}
@@ -94,59 +101,87 @@ func (p *pg) Close() {
 
 func qpg(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
 
+func (p *pg) Quote(s string) string { return qpg(s) }
+
+// searchPath returns the schemas of the search_path in order.
+func (p *pg) searchPath(ctx context.Context) []string {
+	var user string
+	_ = p.pool.QueryRow(ctx, "SELECT current_user").Scan(&user)
+	var out []string
+	for _, s := range strings.Split(p.path, ",") {
+		s = strings.Trim(strings.TrimSpace(s), `"`)
+		if s == "$user" {
+			s = user
+		}
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func (p *pg) Tables(ctx context.Context) (map[string]*Table, error) {
 	rows, err := p.pool.Query(ctx, `
-SELECT c.relname, n.nspname, GREATEST(c.reltuples, 0)::float8,
-  COALESCE((SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
-            WHERE i.indrelid = c.oid AND i.indisprimary LIMIT 1), ''),
+SELECT c.relname, n.nspname, c.relkind::text, GREATEST(c.reltuples, 0)::float8,
+  COALESCE((SELECT array_agg(a.attname ORDER BY k.ord) FROM pg_index i
+            CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+            WHERE i.indrelid = c.oid AND i.indisprimary), '{}'),
   COALESCE((SELECT array_agg(a.attname ORDER BY a.attnum) FROM pg_attribute a
             WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''), '{}'),
   COALESCE((SELECT array_agg(DISTINCT a.attname) FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
-            WHERE i.indrelid = c.oid), '{}')
+            WHERE i.indrelid = c.oid), '{}'),
+  CASE WHEN c.relkind = 'v' THEN pg_get_viewdef(c.oid, true) ELSE '' END,
+  CASE WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid) ELSE '' END
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema')
-  AND n.nspname NOT LIKE 'pg\_toast%' AND n.nspname NOT LIKE '\_rp\_%'`)
+WHERE c.relkind IN ('r','p','v','m') AND NOT c.relispartition
+  AND n.nspname NOT IN ('pg_catalog','information_schema')
+  AND n.nspname NOT LIKE 'pg\_toast%' AND n.nspname NOT LIKE 'pg\_temp%' AND n.nspname NOT LIKE '\_rp\_%'`)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := map[string]*Table{}
+	var all []*Table
 	for rows.Next() {
-		t := &Table{Indexed: map[string]bool{}}
+		t := &Table{Indexed: map[string]bool{}, Indexes: map[string][]string{}}
+		var kind string
 		var idx []string
-		if err := rows.Scan(&t.Name, &t.Schema, &t.Rows, &t.PK, &t.Cols, &idx); err != nil {
+		if err := rows.Scan(&t.Name, &t.Schema, &kind, &t.Rows, &t.PKCols, &t.Cols, &idx, &t.ViewDef, &t.PartKey); err != nil {
+			rows.Close()
 			return nil, err
+		}
+		t.Kind = map[string]string{"r": "table", "p": "partitioned", "v": "view", "m": "matview"}[kind]
+		if len(t.PKCols) > 0 {
+			t.PK = t.PKCols[0]
 		}
 		for _, c := range idx {
 			t.Indexed[strings.ToLower(c)] = true
 		}
-		if prev, ok := out[strings.ToLower(t.Name)]; ok && prev.Schema == "public" {
-			continue
-		}
-		out[strings.ToLower(t.Name)] = t
+		t.SQL = qpg(t.Schema) + "." + qpg(t.Name)
+		all = append(all, t)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := assignKeys(all, p.searchPath(ctx))
 	ir, err := p.pool.Query(ctx, `
-SELECT c.relname, ic.relname,
+SELECT n.nspname, c.relname, ic.relname,
   ARRAY(SELECT a.attname FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, ord)
         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum ORDER BY k.ord)
 FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid JOIN pg_class ic ON ic.oid = i.indexrelid
 JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE '\_rp\_%'`)
+WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE '\_rp\_%' AND NOT c.relispartition`)
 	if err != nil {
 		return nil, err
 	}
 	for ir.Next() {
-		var tn, in string
+		var sn, tn, in string
 		var cols []string
-		if err := ir.Scan(&tn, &in, &cols); err != nil {
+		if err := ir.Scan(&sn, &tn, &in, &cols); err != nil {
 			ir.Close()
 			return nil, err
 		}
-		if t := out[strings.ToLower(tn)]; t != nil {
-			if t.Indexes == nil {
-				t.Indexes = map[string][]string{}
-			}
+		if t := Resolve(out, sn, tn); t != nil {
 			for i := range cols {
 				cols[i] = strings.ToLower(cols[i])
 			}
@@ -154,35 +189,112 @@ WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIK
 		}
 	}
 	ir.Close()
-	for _, t := range out {
-		if t.Rows == 0 {
-			_ = p.pool.QueryRow(ctx, fmt.Sprintf("SELECT count(*)::float8 FROM %s.%s", qpg(t.Schema), qpg(t.Name))).Scan(&t.Rows)
+	// partitions (any depth), parents first
+	pr, err := p.pool.Query(ctx, `
+WITH RECURSIVE tree AS (
+  SELECT i.inhrelid AS oid, i.inhparent AS parent, 1 AS depth FROM pg_inherits i
+  JOIN pg_class c ON c.oid = i.inhrelid WHERE c.relispartition AND c.relkind IN ('r','p','f')
+  UNION ALL
+  SELECT t.oid, i.inhparent, t.depth + 1 FROM tree t JOIN pg_inherits i ON i.inhrelid = t.parent
+  JOIN pg_class c ON c.oid = t.parent WHERE c.relispartition)
+SELECT c.relname, n.nspname, pc.relname, top.relname, tn.nspname, COALESCE(pg_get_expr(c.relpartbound, c.oid), 'DEFAULT'),
+  CASE WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid) ELSE '' END, t.depth
+FROM (SELECT oid, max(depth) AS depth FROM tree GROUP BY oid) d
+JOIN tree t ON t.oid = d.oid AND t.depth = d.depth
+JOIN pg_class c ON c.oid = t.oid JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_inherits pi ON pi.inhrelid = c.oid JOIN pg_class pc ON pc.oid = pi.inhparent
+JOIN pg_class top ON top.oid = t.parent JOIN pg_namespace tn ON tn.oid = top.relnamespace
+ORDER BY t.depth, c.relname`)
+	if err == nil {
+		type prow struct {
+			part     Partition
+			top, tsn string
+			depth    int
+		}
+		var prs []prow
+		for pr.Next() {
+			var x prow
+			if err := pr.Scan(&x.part.Name, &x.part.Schema, &x.part.Parent, &x.top, &x.tsn, &x.part.Bound, &x.part.PartKey, &x.depth); err != nil {
+				pr.Close()
+				return nil, fmt.Errorf("partitions: %w", err)
+			}
+			prs = append(prs, x)
+		}
+		pr.Close()
+		for _, x := range prs {
+			if t := Resolve(out, x.tsn, x.top); t != nil {
+				t.Parts = append(t.Parts, x.part)
+				p.parts[strings.ToLower(x.part.Name)] = t.Key
+			}
 		}
 	}
+	for _, t := range out {
+		if t.Rows == 0 && t.HasData() {
+			_ = p.pool.QueryRow(ctx, fmt.Sprintf("SELECT count(*)::float8 FROM %s", t.SQL)).Scan(&t.Rows)
+		}
+	}
+	p.cat = out
 	return out, nil
+}
+
+// assignKeys gives each relation its catalog key: the bare name for the copy
+// that wins search_path resolution, schema.name for the others.
+func assignKeys(all []*Table, path []string) map[string]*Table {
+	byName := map[string][]*Table{}
+	for _, t := range all {
+		n := strings.ToLower(t.Name)
+		byName[n] = append(byName[n], t)
+	}
+	rank := func(s string) int {
+		for i, x := range path {
+			if x == s {
+				return i
+			}
+		}
+		return len(path) + 1
+	}
+	out := map[string]*Table{}
+	for n, ts := range byName {
+		sort.Slice(ts, func(i, j int) bool { return rank(ts[i].Schema) < rank(ts[j].Schema) })
+		for i, t := range ts {
+			if i == 0 && (len(ts) == 1 || rank(t.Schema) <= len(path)) {
+				t.Key = n
+			} else {
+				t.Key = strings.ToLower(t.Schema + "." + t.Name)
+			}
+			out[t.Key] = t
+		}
+	}
+	return out
 }
 
 func (p *pg) FKs(ctx context.Context, tables map[string]*Table) ([]FK, error) {
 	rows, err := p.pool.Query(ctx, `
-SELECT cl.relname, a.attname, pcl.relname, pa.attname, c.confdeltype::text,
-  EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.conrelid AND i.indkey[0] = c.conkey[1])
+SELECT cn.nspname, cl.relname, pn.nspname, pcl.relname,
+  ARRAY(SELECT a.attname FROM unnest(c.conkey) WITH ORDINALITY k(n, o) JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n ORDER BY k.o),
+  ARRAY(SELECT a.attname FROM unnest(c.confkey) WITH ORDINALITY k(n, o) JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.n ORDER BY k.o),
+  c.confdeltype::text
 FROM pg_constraint c
-JOIN pg_class cl ON cl.oid = c.conrelid
-JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
-JOIN pg_class pcl ON pcl.oid = c.confrelid
-JOIN pg_attribute pa ON pa.attrelid = c.confrelid AND pa.attnum = c.confkey[1]
-JOIN pg_namespace n ON n.oid = cl.relnamespace
-WHERE c.contype = 'f' AND n.nspname NOT LIKE '\_rp\_%'`)
+JOIN pg_class cl ON cl.oid = c.conrelid JOIN pg_namespace cn ON cn.oid = cl.relnamespace
+JOIN pg_class pcl ON pcl.oid = c.confrelid JOIN pg_namespace pn ON pn.oid = pcl.relnamespace
+WHERE c.contype = 'f' AND c.conparentid = 0 AND NOT cl.relispartition AND cn.nspname NOT LIKE '\_rp\_%'`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []FK
 	for rows.Next() {
+		var cs, ct, ps, pt string
 		f := FK{Declared: true}
-		if err := rows.Scan(&f.Child, &f.ChildCol, &f.Parent, &f.ParentCol, &f.OnDelete, &f.Indexed); err != nil {
+		if err := rows.Scan(&cs, &ct, &ps, &pt, &f.ChildCols, &f.ParentCols, &f.OnDelete); err != nil {
 			return nil, err
 		}
+		child, parent := Resolve(tables, cs, ct), Resolve(tables, ps, pt)
+		if child == nil || parent == nil || len(f.ChildCols) == 0 {
+			continue
+		}
+		f.Child, f.Parent, f.ChildCol, f.ParentCol = child.Key, parent.Key, f.ChildCols[0], f.ParentCols[0]
+		f.Indexed = fkIndexed(child, f.ChildCols)
 		out = append(out, f)
 	}
 	return InferFKs(tables, out), rows.Err()
@@ -190,6 +302,20 @@ WHERE c.contype = 'f' AND n.nspname NOT LIKE '\_rp\_%'`)
 
 func (p *pg) HashPred(expr string, frac float64) string {
 	return fmt.Sprintf("((hashtextextended((%s)::text, 0) %% 10000 + 10000) %% 10000) < %d", expr, int(frac*10000+0.5))
+}
+
+func (p *pg) KeyExpr(t *Table, alias string) string {
+	switch len(t.PKCols) {
+	case 0:
+		return alias + "::text"
+	case 1:
+		return alias + "." + qpg(t.PKCols[0])
+	}
+	var cs []string
+	for _, c := range t.PKCols {
+		cs = append(cs, alias+"."+qpg(c))
+	}
+	return "ROW(" + strings.Join(cs, ", ") + ")"
 }
 
 func (p *pg) FirstValues(ctx context.Context, sql string) ([]string, error) {
@@ -255,6 +381,7 @@ func (p *pg) streamDocker(container string) (string, error) {
 	cmd.Stdout, cmd.Stderr = f, f
 	if err := cmd.Start(); err != nil {
 		f.Close()
+		os.Remove(f.Name())
 		return "", fmt.Errorf("docker logs %s: %w", container, err)
 	}
 	p.stream = cmd
@@ -282,10 +409,10 @@ func (p *pg) findLog(ctx context.Context) (string, error) {
 		}
 	}
 	for _, c := range []string{
-		fmt.Sprintf("/opt/homebrew/var/log/postgresql@%d.log", p.major),
-		fmt.Sprintf("/usr/local/var/log/postgresql@%d.log", p.major),
+		fmt.Sprintf("/opt/homebrew/var/log/postgresql@%d.log", p.info.Major),
+		fmt.Sprintf("/usr/local/var/log/postgresql@%d.log", p.info.Major),
 		"/opt/homebrew/var/log/postgres.log", "/usr/local/var/log/postgres.log",
-		fmt.Sprintf("/var/log/postgresql/postgresql-%d-main.log", p.major),
+		fmt.Sprintf("/var/log/postgresql/postgresql-%d-main.log", p.info.Major),
 	} {
 		if st, err := os.Stat(c); err == nil && time.Since(st.ModTime()) < 72*time.Hour {
 			return c, nil
@@ -294,7 +421,7 @@ func (p *pg) findLog(ctx context.Context) (string, error) {
 	if c := p.dockerContainer(); c != "" {
 		return p.streamDocker(c)
 	}
-	return "", errors.New("cannot locate the Postgres server log; pass --pg-log-file <path> (or docker:<container>), or enable logging_collector")
+	return "", errors.New("cannot locate the Postgres server log; pass --pg-log-file <path> (or docker:<container>), enable logging_collector, or use --capture proxy")
 }
 
 func (p *pg) StartCapture(ctx context.Context) error {
@@ -410,8 +537,8 @@ func (p *pg) Window(ctx context.Context, from, to Mark) ([]analyze.Stmt, error) 
 				continue
 			}
 			d, _ := strconv.ParseFloat(m[1], 64)
-			sql := strings.TrimSpace(m[3])
-			st := analyze.Stmt{SQL: sql, DurMs: d, Kind: sqlutil.Kind(sql), Fingerprint: sqlutil.Fingerprint(sql), Tables: sqlutil.Tables(sql)}
+			st := MakeStmt("postgres", strings.TrimSpace(m[3]), p.cat)
+			st.DurMs, st.Conn = d, e.pid
 			out = append(out, st)
 			lastByPid[e.pid] = len(out) - 1
 		case "DETAIL":
@@ -419,30 +546,38 @@ func (p *pg) Window(ctx context.Context, from, to Mark) ([]analyze.Stmt, error) 
 			if !ok || !strings.HasPrefix(e.msg, "Parameters:") || out[i].Params != nil {
 				continue
 			}
-			ps := map[int]string{}
-			maxI := 0
-			for _, pm := range pgParams.FindAllStringSubmatch(e.msg, -1) {
-				n, _ := strconv.Atoi(pm[1])
-				v := pm[2]
-				if v == "NULL" {
-					v = nullMarker
-				} else {
-					v = strings.ReplaceAll(v[1:len(v)-1], "''", "'")
-				}
-				ps[n] = v
-				if n > maxI {
-					maxI = n
-				}
-			}
-			params := make([]string, maxI)
-			for n, v := range ps {
-				params[n-1] = v
-			}
-			out[i].Params = params
+			out[i].Params = ParsePGParams(e.msg)
 		}
 	}
 	return out, nil
 }
+
+// ParsePGParams parses a "Parameters: $1 = '…', $2 = NULL" log detail.
+func ParsePGParams(msg string) []string {
+	ps := map[int]string{}
+	maxI := 0
+	for _, pm := range pgParams.FindAllStringSubmatch(msg, -1) {
+		n, _ := strconv.Atoi(pm[1])
+		v := pm[2]
+		if v == "NULL" {
+			v = nullMarker
+		} else {
+			v = strings.ReplaceAll(v[1:len(v)-1], "''", "'")
+		}
+		ps[n] = v
+		if n > maxI {
+			maxI = n
+		}
+	}
+	params := make([]string, maxI)
+	for n, v := range ps {
+		params[n-1] = v
+	}
+	return params
+}
+
+// NullParam is the marker for a NULL bind parameter.
+func NullParam() string { return nullMarker }
 
 // ---------------------------------------------------------------- explain
 
@@ -456,7 +591,7 @@ func pgInline(st analyze.Stmt) string {
 	return sqlutil.InlinePG(st.SQL, st.Params, nulls)
 }
 
-func (p *pg) Explain(ctx context.Context, st analyze.Stmt, ns string, tables map[string]*Table) (*plan.Plan, error) {
+func (p *pg) Explain(ctx context.Context, st analyze.Stmt, tgt Target) (*plan.Plan, error) {
 	sql := pgInline(st)
 	tx, err := p.ex.Begin(ctx)
 	if err != nil {
@@ -466,31 +601,35 @@ func (p *pg) Explain(ctx context.Context, st analyze.Stmt, ns string, tables map
 	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '120s'; SET LOCAL max_parallel_workers_per_gather = 0"); err != nil {
 		return nil, err
 	}
-	if ns != "" {
-		schemas := map[string][]string{}
-		for _, t := range st.Tables {
-			if tb := tables[t]; tb != nil {
-				schemas[tb.Schema] = append(schemas[tb.Schema], tb.Name)
+	if tgt.NS != "" {
+		rw, err := rewriteTo("postgres", sql, p.cat, tgt)
+		switch {
+		case err == nil:
+			sql = rw
+		case tgt.Only != nil:
+			return nil, fmt.Errorf("per-table replay needs a parsable statement: %w", err)
+		default: // unparsable: unqualified names via search_path, qualified ones by regex
+			schemas := map[string][]string{}
+			for _, k := range st.Tables {
+				if tb := p.cat[k]; tb != nil {
+					schemas[tb.Schema] = append(schemas[tb.Schema], tb.Name)
+				}
 			}
-		}
-		for s, ts := range schemas {
-			sql = sqlutil.RewriteSchema(sql, s, ns, ts)
-		}
-		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path = %s, %s", qpg(ns), p.path)); err != nil {
-			return nil, err
+			for s, ts := range schemas {
+				sql = sqlutil.RewriteSchema(sql, s, tgt.NS, ts)
+			}
+			if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path = %s, %s", qpg(tgt.NS), p.path)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	var out string
 	if st.Generic && len(st.Params) > 0 {
 		// Prepared statements in the app switch to a generic plan after 5
 		// executions; replay the same way so plans and timings match.
-		raw := st.SQL
-		if ns != "" {
-			for _, t := range st.Tables {
-				if tb := tables[t]; tb != nil {
-					raw = sqlutil.RewriteSchema(raw, tb.Schema, ns, []string{tb.Name})
-				}
-			}
+		raw, err := rewriteTo("postgres", st.SQL, p.cat, tgt)
+		if err != nil {
+			raw = st.SQL
 		}
 		name := fmt.Sprintf("rp_g%d", time.Now().UnixNano())
 		var args []string
@@ -506,20 +645,28 @@ func (p *pg) Explain(ctx context.Context, st analyze.Stmt, ns string, tables map
 		}
 		if _, err := tx.Exec(ctx, "PREPARE "+name+" AS "+raw); err == nil {
 			defer p.ex.Exec(context.Background(), "DEALLOCATE "+name)
-			if err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE "+name+"("+strings.Join(args, ", ")+")", pgx.QueryExecModeSimpleProtocol).Scan(&out); err != nil {
+			if err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON) EXECUTE "+name+"("+strings.Join(args, ", ")+")", pgx.QueryExecModeSimpleProtocol).Scan(&out); err != nil {
 				return nil, err
 			}
-			return plan.ParsePostgresJSON([]byte(out))
+			pl, err := plan.ParsePostgresJSON([]byte(out))
+			if err == nil {
+				normalizeRelations(pl, p.cat, p.parts)
+			}
+			return pl, err
 		}
 		// parameter types not inferable → fall back to a custom plan in a fresh tx
 		tx.Rollback(ctx)
 		st.Generic = false
-		return p.Explain(ctx, st, ns, tables)
+		return p.Explain(ctx, st, tgt)
 	}
-	if err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+sql, pgx.QueryExecModeSimpleProtocol).Scan(&out); err != nil {
+	if err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON) "+sql, pgx.QueryExecModeSimpleProtocol).Scan(&out); err != nil {
 		return nil, err
 	}
-	return plan.ParsePostgresJSON([]byte(out))
+	pl, err := plan.ParsePostgresJSON([]byte(out))
+	if err == nil {
+		normalizeRelations(pl, p.cat, p.parts)
+	}
+	return pl, err
 }
 
 // DuplicateValue extracts the conflicting value from a unique violation.
@@ -554,57 +701,170 @@ func FKViolation(err error) (string, string, string, bool) {
 
 // ---------------------------------------------------------------- subsets
 
+// createLike creates ns.<t> with t's structure; partitioned tables keep their
+// partitions so the planner can prune them as it does on the real table.
+func (p *pg) createLike(ctx context.Context, ns string, t *Table) error {
+	dst := qpg(ns) + "." + qpg(t.NSName())
+	stmts := []string{fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", dst)}
+	switch {
+	case t.Kind == "partitioned" && t.PartKey != "":
+		stmts = append(stmts, fmt.Sprintf("CREATE TABLE %s (LIKE %s INCLUDING ALL) PARTITION BY %s", dst, t.SQL, t.PartKey))
+		names := map[string]string{} // real partition → copy name
+		for i, pt := range t.Parts {
+			n := fmt.Sprintf("%s__rp_part%d", t.NSName(), i)
+			names[pt.Name] = n
+			p.parts[strings.ToLower(n)] = t.Key // plans on the copy map back to the table
+			parent := dst
+			if c, ok := names[pt.Parent]; ok {
+				parent = qpg(ns) + "." + qpg(c)
+			}
+			s := fmt.Sprintf("CREATE TABLE %s.%s PARTITION OF %s %s", qpg(ns), qpg(n), parent, pt.Bound)
+			if pt.PartKey != "" {
+				s += " PARTITION BY " + pt.PartKey
+			}
+			stmts = append(stmts, s)
+		}
+	case t.Kind == "matview":
+		stmts = append(stmts, fmt.Sprintf("CREATE TABLE %s (LIKE %s)", dst, t.SQL))
+	default:
+		stmts = append(stmts, fmt.Sprintf("CREATE TABLE %s (LIKE %s INCLUDING ALL)", dst, t.SQL))
+	}
+	for _, s := range stmts {
+		if _, err := p.pool.Exec(ctx, s); err != nil {
+			return fmt.Errorf("%s: %w", s, err)
+		}
+	}
+	if t.Kind == "matview" { // copy its indexes so plans match
+		var defs []string
+		rows, err := p.pool.Query(ctx, "SELECT pg_get_indexdef(indexrelid) FROM pg_index WHERE indrelid = $1::regclass", t.SQL)
+		if err == nil {
+			for rows.Next() {
+				var d string
+				if rows.Scan(&d) == nil {
+					defs = append(defs, d)
+				}
+			}
+			rows.Close()
+		}
+		for i, d := range defs {
+			if _, on, ok := strings.Cut(d, " USING "); ok {
+				_, _ = p.pool.Exec(ctx, fmt.Sprintf("CREATE INDEX %s ON %s USING %s", qpg(fmt.Sprintf("%s_i%d", t.NSName(), i)), dst, on))
+			}
+		}
+	}
+	return nil
+}
+
+func (p *pg) srcName(src string, t *Table) string {
+	if src != "" {
+		return qpg(src) + "." + qpg(t.NSName())
+	}
+	return t.SQL
+}
+
 func (p *pg) BuildSubset(ctx context.Context, ns string, frac float64, order []*Table, fks []FK, src string) (map[string]float64, error) {
 	if _, err := p.pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+qpg(ns)); err != nil {
 		return nil, err
 	}
 	inScope := map[string]bool{}
 	for _, t := range order {
-		inScope[t.Name] = true
+		inScope[t.Key] = true
 	}
 	counts := map[string]float64{}
+	var views []*Table
 	for _, t := range order {
+		if !t.HasData() {
+			views = append(views, t)
+			continue
+		}
+		if err := p.createLike(ctx, ns, t); err != nil {
+			return nil, fmt.Errorf("subset %s.%s: %w", ns, t.Key, err)
+		}
 		cols := make([]string, len(t.Cols))
 		for i, c := range t.Cols {
 			cols[i] = qpg(c)
 		}
 		cl := strings.Join(cols, ", ")
 		scl := "s." + strings.Join(cols, ", s.")
-		pred := subsetPred(p, t, ns, frac, fks, inScope, qpg)
-		stmts := []string{
-			fmt.Sprintf("DROP TABLE IF EXISTS %s.%s CASCADE", qpg(ns), qpg(t.Name)),
-			fmt.Sprintf("CREATE TABLE %s.%s (LIKE %s.%s INCLUDING ALL)", qpg(ns), qpg(t.Name), qpg(t.Schema), qpg(t.Name)),
-			fmt.Sprintf("INSERT INTO %s.%s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM %s.%s s WHERE %s", qpg(ns), qpg(t.Name), cl, scl, qpg(srcSchema(src, t)), qpg(t.Name), pred),
-			fmt.Sprintf("ANALYZE %s.%s", qpg(ns), qpg(t.Name)),
+		pred := subsetPred(p, t, ns, frac, fks, p.cat, inScope)
+		dst := qpg(ns) + "." + qpg(t.NSName())
+		srcT := p.srcName(src, t)
+		if src != "" && !t.HasData() {
+			srcT = t.SQL
 		}
-		for _, s := range stmts {
+		for _, s := range []string{
+			fmt.Sprintf("INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM %s s WHERE %s", dst, cl, scl, srcT, pred),
+			fmt.Sprintf("ANALYZE %s", dst),
+		} {
 			if _, err := p.pool.Exec(ctx, s); err != nil {
-				return nil, fmt.Errorf("subset %s.%s: %w", ns, t.Name, err)
+				return nil, fmt.Errorf("subset %s.%s: %w", ns, t.Key, err)
 			}
 		}
 		var n float64
-		_ = p.pool.QueryRow(ctx, fmt.Sprintf("SELECT count(*)::float8 FROM %s.%s", qpg(ns), qpg(t.Name))).Scan(&n)
-		counts[t.Name] = n
+		_ = p.pool.QueryRow(ctx, fmt.Sprintf("SELECT count(*)::float8 FROM %s", dst)).Scan(&n)
+		counts[t.Key] = n
 	}
 	// declared FKs make cascades/RI checks cost the same as in the real schema
 	rules := map[string]string{"a": "NO ACTION", "r": "RESTRICT", "c": "CASCADE", "n": "SET NULL", "d": "SET DEFAULT"}
 	for _, f := range fks {
 		if f.Declared && inScope[f.Child] && inScope[f.Parent] {
+			c, pt := p.cat[f.Child], p.cat[f.Parent]
+			var cc, pc []string
+			for i := range f.ChildCols {
+				cc = append(cc, qpg(f.ChildCols[i]))
+				pc = append(pc, qpg(f.ParentCols[i]))
+			}
 			_, err := p.pool.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.%s ADD FOREIGN KEY (%s) REFERENCES %s.%s (%s) ON DELETE %s",
-				qpg(ns), qpg(f.Child), qpg(f.ChildCol), qpg(ns), qpg(f.Parent), qpg(f.ParentCol), rules[f.OnDelete]))
+				qpg(ns), qpg(c.NSName()), strings.Join(cc, ", "), qpg(ns), qpg(pt.NSName()), strings.Join(pc, ", "), rules[f.OnDelete]))
 			if err != nil {
 				return nil, fmt.Errorf("subset fk %s.%s: %w", f.Child, f.ChildCol, err)
 			}
 		}
 	}
+	for _, v := range sortViews("postgres", views, p.cat) {
+		def, err := rewriteTo("postgres", v.ViewDef, p.cat, Target{NS: ns, Only: inScope})
+		if err != nil {
+			return nil, fmt.Errorf("subset view %s: %w", v.Key, err)
+		}
+		if _, err := p.pool.Exec(ctx, fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS %s", qpg(ns), qpg(v.NSName()), def)); err != nil {
+			return nil, fmt.Errorf("subset view %s: %w", v.Key, err)
+		}
+	}
 	return counts, nil
 }
 
-func srcSchema(src string, t *Table) string {
-	if src != "" {
-		return src
+func (p *pg) BuildShrunk(ctx context.Context, ns string, frac float64, t *Table, keep []string, src string) (float64, error) {
+	if _, err := p.pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+qpg(ns)); err != nil {
+		return 0, err
 	}
-	return t.Schema
+	if err := p.createLike(ctx, ns, t); err != nil {
+		return 0, err
+	}
+	cols := make([]string, len(t.Cols))
+	for i, c := range t.Cols {
+		cols[i] = qpg(c)
+	}
+	cl := strings.Join(cols, ", ")
+	pred := p.HashPred(p.KeyExpr(t, "s"), frac)
+	if len(keep) > 0 && t.PK != "" {
+		var ks []string
+		for _, k := range keep {
+			ks = append(ks, "'"+strings.ReplaceAll(k, "'", "''")+"'")
+		}
+		pred = fmt.Sprintf("(%s OR s.%s::text IN (%s))", pred, qpg(t.PK), strings.Join(ks, ", "))
+	}
+	dst := qpg(ns) + "." + qpg(t.NSName())
+	for _, s := range []string{
+		fmt.Sprintf("INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE SELECT s.%s FROM %s s WHERE %s", dst, cl, strings.Join(cols, ", s."), p.srcName(src, t), pred),
+		"ANALYZE " + dst,
+	} {
+		if _, err := p.pool.Exec(ctx, s); err != nil {
+			return 0, fmt.Errorf("shrink %s: %w", t.Key, err)
+		}
+	}
+	var n float64
+	err := p.pool.QueryRow(ctx, "SELECT count(*)::float8 FROM "+dst).Scan(&n)
+	return n, err
 }
 
 func (p *pg) DropNamespace(ctx context.Context, ns string) error {
@@ -626,12 +886,15 @@ func (p *pg) Snapshot(ctx context.Context, tables []*Table) error {
 		return err
 	}
 	for _, t := range tables {
-		if _, err := p.pool.Exec(ctx, fmt.Sprintf("CREATE TABLE %s.%s AS TABLE %s.%s", SnapNS, qpg(t.Name), qpg(t.Schema), qpg(t.Name))); err != nil {
-			return fmt.Errorf("snapshot %s: %w", t.Name, err)
+		if t.Kind != "table" && t.Kind != "partitioned" {
+			continue
+		}
+		if _, err := p.pool.Exec(ctx, fmt.Sprintf("CREATE TABLE %s.%s AS TABLE %s", SnapNS, qpg(t.NSName()), t.SQL)); err != nil {
+			return fmt.Errorf("snapshot %s: %w", t.Key, err)
 		}
 		for _, c := range t.Cols {
 			var seq *string
-			_ = p.pool.QueryRow(ctx, "SELECT pg_get_serial_sequence($1, $2)", qpg(t.Schema)+"."+qpg(t.Name), c).Scan(&seq)
+			_ = p.pool.QueryRow(ctx, "SELECT pg_get_serial_sequence($1, $2)", t.SQL, c).Scan(&seq)
 			if seq == nil {
 				continue
 			}
@@ -644,19 +907,25 @@ func (p *pg) Snapshot(ctx context.Context, tables []*Table) error {
 }
 
 func (p *pg) Counters(ctx context.Context) (map[string]float64, error) {
-	rows, err := p.pool.Query(ctx, `SELECT relname, (n_tup_ins + n_tup_upd + n_tup_del)::float8 FROM pg_stat_user_tables WHERE schemaname NOT LIKE '\_rp\_%'`)
+	rows, err := p.pool.Query(ctx, `SELECT schemaname, relname, (n_tup_ins + n_tup_upd + n_tup_del)::float8 FROM pg_stat_user_tables WHERE schemaname NOT LIKE '\_rp\_%'`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := map[string]float64{}
 	for rows.Next() {
-		var n string
+		var s, n string
 		var v float64
-		if err := rows.Scan(&n, &v); err != nil {
+		if err := rows.Scan(&s, &n, &v); err != nil {
 			return nil, err
 		}
-		out[strings.ToLower(n)] = v
+		k := strings.ToLower(n)
+		if top, ok := p.parts[k]; ok {
+			k = top
+		} else if t := Resolve(p.cat, s, n); t != nil {
+			k = t.Key
+		}
+		out[k] += v
 	}
 	return out, rows.Err()
 }
@@ -671,16 +940,19 @@ func (p *pg) Restore(ctx context.Context, tables []*Table) error {
 		return err
 	}
 	for _, t := range tables {
+		if t.Kind != "table" && t.Kind != "partitioned" {
+			continue
+		}
 		cols := make([]string, len(t.Cols))
 		for i, c := range t.Cols {
 			cols[i] = qpg(c)
 		}
 		cl := strings.Join(cols, ", ")
-		if _, err := tx.Exec(ctx, fmt.Sprintf("DELETE FROM %s.%s", qpg(t.Schema), qpg(t.Name))); err != nil {
-			return fmt.Errorf("restore %s: %w", t.Name, err)
+		if _, err := tx.Exec(ctx, fmt.Sprintf("DELETE FROM %s", t.SQL)); err != nil {
+			return fmt.Errorf("restore %s: %w", t.Key, err)
 		}
-		if _, err := tx.Exec(ctx, fmt.Sprintf("INSERT INTO %s.%s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM %s.%s", qpg(t.Schema), qpg(t.Name), cl, cl, SnapNS, qpg(t.Name))); err != nil {
-			return fmt.Errorf("restore %s: %w", t.Name, err)
+		if _, err := tx.Exec(ctx, fmt.Sprintf("INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM %s.%s", t.SQL, cl, cl, SnapNS, qpg(t.NSName()))); err != nil {
+			return fmt.Errorf("restore %s: %w", t.Key, err)
 		}
 	}
 	if _, err := tx.Exec(ctx, fmt.Sprintf("SELECT setval(seq, last_value, is_called) FROM %s._rp_seq", SnapNS)); err != nil {
@@ -690,7 +962,9 @@ func (p *pg) Restore(ctx context.Context, tables []*Table) error {
 		return err
 	}
 	for _, t := range tables {
-		_, _ = p.pool.Exec(ctx, fmt.Sprintf("ANALYZE %s.%s", qpg(t.Schema), qpg(t.Name)))
+		if t.HasData() {
+			_, _ = p.pool.Exec(ctx, "ANALYZE "+t.SQL)
+		}
 	}
 	return nil
 }
@@ -742,4 +1016,164 @@ func (p *pg) Probe(ctx context.Context) error {
 		}
 	}
 	return fmt.Errorf("probe query not found in %s — wrong log file? (set capture.pg_log_file)", p.logPath)
+}
+
+// ---------------------------------------------------------------- HypoPG
+
+func (p *pg) HypoIndex(ctx context.Context, st analyze.Stmt, createIndex string) (Hypo, error) {
+	var h Hypo
+	var avail bool
+	if err := p.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'hypopg')").Scan(&avail); err != nil || !avail {
+		return h, ErrUnsupported
+	}
+	tx, err := p.ex.Begin(ctx)
+	if err != nil {
+		return h, err
+	}
+	defer tx.Rollback(ctx) // also drops the extension if routeperf created it
+	if _, err := tx.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS hypopg"); err != nil {
+		return h, fmt.Errorf("hypopg: %w", err)
+	}
+	defer tx.Exec(context.Background(), "SELECT hypopg_reset()")
+	sql := pgInline(st)
+	estimate := func() (float64, float64, *plan.Plan, error) {
+		var out string
+		if err := tx.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+sql, pgx.QueryExecModeSimpleProtocol).Scan(&out); err != nil {
+			return 0, 0, nil, err
+		}
+		var arr []struct {
+			Plan map[string]any `json:"Plan"`
+		}
+		if err := json.Unmarshal([]byte(out), &arr); err != nil || len(arr) == 0 {
+			return 0, 0, nil, fmt.Errorf("explain json: %v", err)
+		}
+		cost, _ := arr[0].Plan["Total Cost"].(float64)
+		pl, err := plan.ParsePostgresJSON([]byte(out))
+		if err != nil {
+			return 0, 0, nil, err
+		}
+		var rows float64
+		pl.Walk(func(n *plan.Node, _ int) {
+			if n.Scan {
+				rows += n.EstRows
+			}
+		})
+		return cost, rows, pl, nil
+	}
+	var p0 *plan.Plan
+	if h.CostBefore, h.RowsBefore, p0, err = estimate(); err != nil {
+		return h, err
+	}
+	var hypoName string
+	if err := tx.QueryRow(ctx, "SELECT indexname FROM hypopg_create_index($1)", strings.TrimSuffix(strings.TrimSpace(createIndex), ";")).Scan(&hypoName); err != nil {
+		return h, fmt.Errorf("hypopg_create_index: %w", err)
+	}
+	var p1 *plan.Plan
+	if h.CostAfter, h.RowsAfter, p1, err = estimate(); err != nil {
+		return h, err
+	}
+	p1.Walk(func(n *plan.Node, _ int) {
+		if n.Index == hypoName {
+			h.Used = true
+		}
+	})
+	if m := regexp.MustCompile(`(?i)\bON\s+(?:\S+\.)?"?(\w+)"?\s*\(`).FindStringSubmatch(createIndex); m != nil {
+		scanOf := func(pl *plan.Plan) string {
+			out := ""
+			pl.Walk(func(n *plan.Node, _ int) {
+				if out == "" && strings.EqualFold(n.Relation, m[1]) && (n.Scan || n.Op == plan.OpBitmapHeap) {
+					out = n.RawType
+				}
+			})
+			return out
+		}
+		h.ScanBefore, h.ScanAfter = scanOf(p0), scanOf(p1)
+	}
+	h.PlanAfter = p1.Text
+	return h, nil
+}
+
+// ---------------------------------------------------------------- cold cache
+
+// Evict drops the relations' pages from shared_buffers (Postgres 17+,
+// pg_buffercache). The extension is created inside a rolled-back
+// transaction, so nothing is left behind.
+func (p *pg) Evict(ctx context.Context, tables []*Table) error {
+	if p.info.Major < 17 {
+		return fmt.Errorf("%w: evicting shared_buffers needs Postgres 17+ (pg_buffercache_evict)", ErrUnsupported)
+	}
+	var names []string
+	for _, t := range tables {
+		if t.HasData() {
+			names = append(names, t.SQL)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	tx, err := p.ex.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS pg_buffercache"); err != nil {
+		return fmt.Errorf("pg_buffercache: %w", err)
+	}
+	_, err = tx.Exec(ctx, `
+WITH RECURSIVE rels(oid) AS (
+  SELECT x::regclass::oid FROM unnest($1::text[]) x
+  UNION SELECT i.inhrelid FROM pg_inherits i JOIN rels r ON i.inhparent = r.oid),
+all_rels AS (
+  SELECT oid FROM rels
+  UNION SELECT indexrelid FROM pg_index WHERE indrelid IN (SELECT oid FROM rels)
+  UNION SELECT reltoastrelid FROM pg_class WHERE oid IN (SELECT oid FROM rels) AND reltoastrelid <> 0)
+SELECT count(*) FROM (
+  SELECT pg_buffercache_evict(b.bufferid) FROM pg_buffercache b
+  WHERE b.reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+    AND b.relfilenode IN (SELECT pg_relation_filenode(oid) FROM all_rels)) e`, names)
+	return err
+}
+
+// ---------------------------------------------------------------- load
+
+func (p *pg) LoadSample(ctx context.Context) (LoadSample, error) {
+	s := LoadSample{Waits: map[string]int{}, Blocked: map[string]int{}}
+	err := p.pool.QueryRow(ctx, `
+SELECT count(*) FILTER (WHERE state = 'active'), count(*), current_setting('max_connections')::int,
+  count(*) FILTER (WHERE wait_event_type = 'Lock')
+FROM pg_stat_activity WHERE datname = current_database() AND backend_type = 'client backend'
+  AND pid <> pg_backend_pid() AND application_name NOT IN ('routeperf', 'rp-probe')`).Scan(&s.Active, &s.Connections, &s.MaxConnections, &s.LockWaits)
+	if err != nil {
+		return s, err
+	}
+	rows, err := p.pool.Query(ctx, `
+SELECT COALESCE(wait_event_type || ':' || wait_event, 'CPU'), count(*)::int FROM pg_stat_activity
+WHERE datname = current_database() AND state = 'active' AND backend_type = 'client backend'
+  AND pid <> pg_backend_pid() AND application_name NOT IN ('routeperf', 'rp-probe') GROUP BY 1`)
+	if err == nil {
+		for rows.Next() {
+			var k string
+			var n int
+			if rows.Scan(&k, &n) == nil {
+				s.Waits[k] = n
+			}
+		}
+		rows.Close()
+	}
+	rows, err = p.pool.Query(ctx, `SELECT c.relname, count(*)::int FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+WHERE NOT l.granted AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) GROUP BY 1`)
+	if err == nil {
+		for rows.Next() {
+			var k string
+			var n int
+			if rows.Scan(&k, &n) == nil {
+				if top, ok := p.parts[strings.ToLower(k)]; ok {
+					k = top
+				}
+				s.Blocked[k] += n
+			}
+		}
+		rows.Close()
+	}
+	return s, nil
 }

@@ -22,7 +22,20 @@ var (
 	reDeleteT  = regexp.MustCompile("(?i)^\\s*delete\\s+from\\s+[`\"]?(\\w+)[`\"]?(?:\\.[`\"]?(\\w+)[`\"]?)?")
 	rePgParam  = regexp.MustCompile(`\$(\d+)`)
 	reLimitNum = regexp.MustCompile(`(?i)\blimit\s+(\d+)`)
+	reTrace    = regexp.MustCompile(`traceparent(?:=|%3[dD])(?:'|%27)?00-([0-9a-f]{32})-`)
 )
+
+// TraceID extracts the W3C trace-id from a sqlcommenter comment
+// (/*traceparent='00-<trace-id>-<span-id>-01'*/), or "".
+func TraceID(sql string) string {
+	if !strings.Contains(sql, "traceparent") {
+		return ""
+	}
+	if m := reTrace.FindStringSubmatch(sql); m != nil {
+		return m[1]
+	}
+	return ""
+}
 
 // Normalize strips comments/literals so equivalent statements compare equal.
 func Normalize(sql string) string {

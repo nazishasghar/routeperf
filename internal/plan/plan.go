@@ -41,13 +41,16 @@ type Node struct {
 	Op          Op      `json:"op"`
 	RawType     string  `json:"raw"`
 	Relation    string  `json:"relation,omitempty"`
+	Schema      string  `json:"-"`
+	Alias       string  `json:"-"`
 	Index       string  `json:"index,omitempty"`
 	Rows        float64 `json:"rows"`         // total rows out, all loops
 	Loops       float64 `json:"loops"`        // executions
 	RowsRemoved float64 `json:"rows_removed"` // total, all loops
 	EstRows     float64 `json:"est_rows"`     // planner estimate per loop
 	Pages       float64 `json:"pages,omitempty"`
-	TimeMs      float64 `json:"time_ms"` // inclusive, all loops
+	Reads       float64 `json:"reads,omitempty"` // pages read from outside shared buffers (inclusive)
+	TimeMs      float64 `json:"time_ms"`         // inclusive, all loops
 	Blocking    bool    `json:"blocking,omitempty"`
 	Scan        bool    `json:"scan,omitempty"` // reads table/index rows
 	Filter      string  `json:"filter,omitempty"`
@@ -208,6 +211,14 @@ func renderText(n *Node, d int, b *strings.Builder) {
 	}
 }
 
+// Reindex reassigns node paths after relation names change (partitions
+// and namespace copies mapped back to their table).
+func Reindex(p *Plan) {
+	if p.Root != nil {
+		assignPaths(p.Root)
+	}
+}
+
 // Finish assigns node paths and renders the text tree.
 func Finish(p *Plan) *Plan { return finish(p) }
 
@@ -254,12 +265,15 @@ func pgNode(m map[string]any) *Node {
 	n := &Node{
 		RawType:     typ,
 		Relation:    str(m["Relation Name"]),
+		Schema:      str(m["Schema"]),
+		Alias:       str(m["Alias"]),
 		Index:       str(m["Index Name"]),
 		Loops:       loops,
 		Rows:        num(m["Actual Rows"]) * loops,
 		RowsRemoved: (num(m["Rows Removed by Filter"]) + num(m["Rows Removed by Index Recheck"]) + num(m["Rows Removed by Join Filter"])) * loops,
 		EstRows:     num(m["Plan Rows"]),
 		Pages:       num(m["Shared Hit Blocks"]) + num(m["Shared Read Blocks"]),
+		Reads:       num(m["Shared Read Blocks"]) + num(m["Local Read Blocks"]),
 		TimeMs:      num(m["Actual Total Time"]) * loops,
 		Filter:      str(m["Filter"]),
 		IndexCond:   firstNonEmpty(str(m["Index Cond"]), str(m["Recheck Cond"]), str(m["Hash Cond"]), str(m["Join Filter"])),
@@ -288,6 +302,9 @@ func pgNode(m map[string]any) *Node {
 		}
 	case "Bitmap Index Scan":
 		n.Op = OpIndexRange
+		if cond := str(m["Index Cond"]); cond != "" && !rangeOps.MatchString(cond) {
+			n.Op = OpIndexLookup // equality: bounded matches per lookup
+		}
 	case "Bitmap Heap Scan":
 		n.Op, n.Scan = OpBitmapHeap, true
 	case "Tid Scan", "Tid Range Scan":
@@ -344,6 +361,20 @@ func pgNode(m map[string]any) *Node {
 			if km, ok := k.(map[string]any); ok {
 				n.Children = append(n.Children, pgNode(km))
 			}
+		}
+	}
+	if typ == "Bitmap Heap Scan" { // bitmap index scans read the heap scan's table
+		var mark func(c *Node)
+		mark = func(c *Node) {
+			if c.Relation == "" && (c.Op == OpIndexRange || c.Op == OpIndexLookup) {
+				c.Relation, c.Schema = n.Relation, n.Schema
+			}
+			for _, g := range c.Children {
+				mark(g)
+			}
+		}
+		for _, c := range n.Children {
+			mark(c)
 		}
 	}
 	return n
@@ -427,6 +458,7 @@ func myNode(body string, aliases map[string]string) *Node {
 	resolve := func() {
 		if m := myOn.FindStringSubmatch(desc); m != nil {
 			rel := strings.Trim(m[1], "`")
+			n.Alias = rel
 			if t, ok := aliases[strings.ToLower(rel)]; ok {
 				rel = t
 			}

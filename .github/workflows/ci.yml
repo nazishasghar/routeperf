@@ -10,3 +10,44 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
       - run: make build && bin/routeperf version
+
+  # End to end: seeds the testbed (an API with planted problems) in real
+  # Postgres and MySQL, runs routeperf against it and asserts every planted
+  # problem is found with the right Big O and fix. Postgres runs in a service
+  # container, so this also exercises SQL capture through `docker logs`.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_ROOT_HOST: "%"
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h127.0.0.1 --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - name: end-to-end against Postgres 17 and MySQL 8.4
+        run: go test -tags integration -count=1 -v -timeout 40m ./integration/
+        env:
+          RP_IT_PG: postgres://postgres:postgres@localhost:5432/routeperf_it
+          RP_IT_MYSQL: mysql://root@127.0.0.1:3306/routeperf_it
+      - name: keep the reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-reports
+          path: ${{ runner.temp }}/routeperf-it/
+          if-no-files-found: ignore

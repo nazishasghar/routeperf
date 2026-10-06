@@ -25,9 +25,25 @@ import (
 )
 
 var (
-	db      *sql.DB
-	dialect string
+	db         *sql.DB
+	dialect    string
+	dbName     string
+	sqlcomment bool
 )
+
+// sc tags a statement with the request's traceparent, as sqlcommenter does.
+func sc(r *http.Request, s string) string {
+	if !sqlcomment {
+		return s
+	}
+	if tp := r.Header.Get("traceparent"); tp != "" {
+		return s + " /*traceparent='" + url.QueryEscape(tp) + "'*/"
+	}
+	return s
+}
+
+// sq is q (placeholder conversion) plus the sqlcommenter tag.
+func sq(r *http.Request, s string) string { return sc(r, q(s)) }
 
 func main() {
 	dbURL := flag.String("db-url", "", "postgres://… or mysql://…")
@@ -38,11 +54,14 @@ func main() {
 	ipo := flag.Int("items-per-order", 3, "items per order")
 	spu := flag.Int("sessions-per-user", 2, "sessions per user")
 	noise := flag.Duration("background-noise", 0, "run a background query at this interval (simulates a cron job), e.g. 100ms")
+	grpcAddr := flag.String("grpc-addr", "", "also serve the gRPC API (with server reflection) on this address, e.g. 127.0.0.1:50051")
+	flag.BoolVar(&sqlcomment, "sqlcommenter", false, "append /*traceparent='…'*/ from the request to every SQL statement (like OpenTelemetry sqlcommenter)")
 	flag.Parse()
 	if *dbURL == "" {
 		log.Fatal("--db-url required")
 	}
 	driver, dsn, dbname, adminDSN := parse(*dbURL)
+	dbName = dbname
 	if *seed {
 		admin, err := sql.Open(driver, adminDSN)
 		must(err)
@@ -68,7 +87,7 @@ func main() {
 		t0 := time.Now()
 		seedData(*users, *opu, *ipo, *spu)
 		log.Printf("seeded in %s", time.Since(t0).Round(time.Millisecond))
-		for _, t := range []string{"users", "orders", "order_items", "sessions"} {
+		for _, t := range []string{"users", "orders", "order_items", "sessions", "events"} {
 			var n int
 			_ = db.QueryRow("SELECT COUNT(*) FROM " + t).Scan(&n)
 			log.Printf("  %-12s %d rows", t, n)
@@ -83,7 +102,11 @@ func main() {
 			}
 		}()
 	}
+	if *grpcAddr != "" {
+		serveGRPC(*grpcAddr)
+	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /graphql", authed(graphqlHandler))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]any{"ok": true}) })
 	mux.HandleFunc("GET /swagger.json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -105,6 +128,14 @@ func main() {
 	mux.HandleFunc("GET /notes/{id}", authed(getNote))
 	mux.HandleFunc("PUT /notes/{id}", authed(updateNote))
 	mux.HandleFunc("DELETE /notes/{id}", authed(deleteNote))
+	mux.HandleFunc("GET /events/search", authed(searchEvents))
+	mux.HandleFunc("GET /users/{id}/events", authed(userEvents))
+	mux.HandleFunc("GET /users/{id}/totals", authed(userTotals))
+	mux.HandleFunc("GET /orders/by-country", authed(ordersByCountry))
+	mux.HandleFunc("GET /archive/orders/{id}", authed(archivedOrder))
+	mux.HandleFunc("GET /events/feed", authed(eventFeed))
+	mux.HandleFunc("POST /sessions", authed(createSession))
+	mux.HandleFunc("POST /users/{id}/avatar", authed(uploadAvatar))
 	log.Printf("testbed (%s) listening on %s", dialect, *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }
@@ -162,9 +193,11 @@ func q(s string) string {
 
 func seedData(u, opu, ipo, spu int) {
 	var stmts []string
+	year := time.Now().Year()
 	if dialect == "postgres" {
 		stmts = []string{
-			"DROP TABLE IF EXISTS notes, order_items, orders, sessions, users CASCADE",
+			"DROP TABLE IF EXISTS events, notes, order_items, orders, sessions, users CASCADE",
+			"DROP SCHEMA IF EXISTS archive CASCADE",
 			"CREATE TABLE users (id bigserial PRIMARY KEY, email varchar(255) NOT NULL UNIQUE, name varchar(100), country char(2), created_at timestamp NOT NULL DEFAULT now())",
 			// planted: orders.user_id FK without index
 			"CREATE TABLE orders (id bigserial PRIMARY KEY, user_id bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE, status varchar(16) NOT NULL, total_cents int NOT NULL, created_at timestamp NOT NULL)",
@@ -180,7 +213,19 @@ func seedData(u, opu, ipo, spu int) {
 			"CREATE TABLE notes (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE, body text NOT NULL, created_at timestamp NOT NULL DEFAULT now())",
 			"CREATE INDEX notes_user_id_idx ON notes(user_id)",
 			fmt.Sprintf(`INSERT INTO notes (user_id, body) SELECT g, 'note '||g FROM generate_series(1,%d) g`, u),
-			"ANALYZE users", "ANALYZE orders", "ANALYZE order_items", "ANALYZE sessions", "ANALYZE notes",
+			// partitioned table with a composite primary key; planted: no index on kind
+			"CREATE TABLE events (id bigint NOT NULL, user_id bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind varchar(16) NOT NULL, created_at timestamp NOT NULL, PRIMARY KEY (id, created_at)) PARTITION BY RANGE (created_at)",
+			fmt.Sprintf("CREATE TABLE events_old PARTITION OF events FOR VALUES FROM (MINVALUE) TO ('%d-01-01')", year-1),
+			fmt.Sprintf("CREATE TABLE events_prev PARTITION OF events FOR VALUES FROM ('%d-01-01') TO ('%d-01-01')", year-1, year),
+			fmt.Sprintf("CREATE TABLE events_cur PARTITION OF events FOR VALUES FROM ('%d-01-01') TO (MAXVALUE)", year),
+			"CREATE INDEX events_user_id_idx ON events (user_id)",
+			fmt.Sprintf(`INSERT INTO events SELECT g, 1 + (g %% %d), (ARRAY['click','view','buy','share'])[1+g%%4], now() - (g%%730) * interval '1 day' FROM generate_series(1,%d) g`, u, u*5),
+			// a view over an unindexed join, and a same-named table in another schema
+			"CREATE VIEW user_order_totals AS SELECT u.id, u.email, count(o.id) AS orders, coalesce(sum(o.total_cents), 0) AS total_cents FROM users u LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.id, u.email",
+			"CREATE SCHEMA archive",
+			"CREATE TABLE archive.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL, status varchar(16), total_cents int, created_at timestamp)",
+			"INSERT INTO archive.orders SELECT id, user_id, status, total_cents, created_at FROM orders WHERE id % 5 = 0",
+			"ANALYZE users", "ANALYZE orders", "ANALYZE order_items", "ANALYZE sessions", "ANALYZE notes", "ANALYZE events", "ANALYZE archive.orders",
 		}
 	} else {
 		seq := func(n int) string {
@@ -188,7 +233,8 @@ func seedData(u, opu, ipo, spu int) {
 		}
 		stmts = []string{
 			"SET SESSION cte_max_recursion_depth = 100000000",
-			"DROP TABLE IF EXISTS notes, order_items, orders, sessions, users",
+			"DROP VIEW IF EXISTS user_order_totals",
+			"DROP TABLE IF EXISTS events, notes, order_items, orders, sessions, users",
 			"CREATE TABLE users (id BIGINT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(255) NOT NULL UNIQUE, name VARCHAR(100), country CHAR(2), created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)",
 			// planted: no index (and no FK, which would auto-index) on orders.user_id
 			"CREATE TABLE orders (id BIGINT AUTO_INCREMENT PRIMARY KEY, user_id BIGINT NOT NULL, status VARCHAR(16) NOT NULL, total_cents INT NOT NULL, created_at DATETIME NOT NULL)",
@@ -200,7 +246,15 @@ func seedData(u, opu, ipo, spu int) {
 			fmt.Sprintf("INSERT INTO sessions (user_id, token, created_at) %s SELECT 1 + (g %% %d), MD5(g), NOW() FROM seq", seq(u*spu), u),
 			"CREATE TABLE notes (id CHAR(36) PRIMARY KEY, user_id BIGINT NOT NULL, body TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, KEY notes_user_id_idx (user_id))",
 			fmt.Sprintf("INSERT INTO notes (id, user_id, body) %s SELECT UUID(), g, CONCAT('note ', g) FROM seq", seq(u)),
-			"ANALYZE TABLE users, orders, order_items, sessions, notes",
+			fmt.Sprintf("CREATE TABLE events (id BIGINT NOT NULL, user_id BIGINT NOT NULL, kind VARCHAR(16) NOT NULL, created_at DATETIME NOT NULL, PRIMARY KEY (id, created_at), KEY events_user_id_idx (user_id)) PARTITION BY RANGE (YEAR(created_at)) (PARTITION p_old VALUES LESS THAN (%d), PARTITION p_prev VALUES LESS THAN (%d), PARTITION p_cur VALUES LESS THAN MAXVALUE)", year-1, year),
+			fmt.Sprintf("INSERT INTO events %s SELECT g, 1 + (g %% %d), ELT(1+g%%4,'click','view','buy','share'), NOW() - INTERVAL (g%%730) DAY FROM seq", seq(u*5), u),
+			"CREATE VIEW user_order_totals AS SELECT u.id, u.email, COUNT(o.id) AS orders, COALESCE(SUM(o.total_cents), 0) AS total_cents FROM users u LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.id, u.email",
+			fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s_archive", dbName),
+			fmt.Sprintf("DROP TABLE IF EXISTS %s_archive.orders", dbName),
+			fmt.Sprintf("CREATE TABLE %s_archive.orders (id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL, status VARCHAR(16), total_cents INT, created_at DATETIME)", dbName),
+			fmt.Sprintf("INSERT INTO %s_archive.orders SELECT id, user_id, status, total_cents, created_at FROM orders WHERE id %% 5 = 0", dbName),
+			"ANALYZE TABLE users, orders, order_items, sessions, notes, events",
+			fmt.Sprintf("ANALYZE TABLE %s_archive.orders", dbName),
 		}
 	}
 	conn, err := db.Conn(context.Background())
@@ -308,7 +362,7 @@ func login(w http.ResponseWriter, r *http.Request) {
 func listUsers(w http.ResponseWriter, r *http.Request) {
 	limit := intParam(r, "limit", 20, 1000)
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
-	rows, err := db.Query(q("SELECT id, email, name, country, created_at FROM users ORDER BY id LIMIT ? OFFSET ?"), limit, offset)
+	rows, err := db.Query(sq(r, "SELECT id, email, name, country, created_at FROM users ORDER BY id LIMIT ? OFFSET ?"), limit, offset)
 	if err != nil {
 		fail(w, 500, err.Error())
 		return
@@ -330,7 +384,7 @@ func getUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var u User
-	err := db.QueryRow(q("SELECT id, email, name, country, created_at FROM users WHERE id = ?"), id).Scan(&u.ID, &u.Email, &u.Name, &u.Country, &u.CreatedAt)
+	err := db.QueryRow(sq(r, "SELECT id, email, name, country, created_at FROM users WHERE id = ?"), id).Scan(&u.ID, &u.Email, &u.Name, &u.Country, &u.CreatedAt)
 	if err == sql.ErrNoRows {
 		fail(w, 404, "not found")
 		return
@@ -349,10 +403,10 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 	}
 	var err error
 	if dialect == "postgres" {
-		err = db.QueryRow(q("INSERT INTO users (email, name, country) VALUES (?, ?, ?) RETURNING id"), u.Email, u.Name, u.Country).Scan(&u.ID)
+		err = db.QueryRow(sq(r, "INSERT INTO users (email, name, country) VALUES (?, ?, ?) RETURNING id"), u.Email, u.Name, u.Country).Scan(&u.ID)
 	} else {
 		var res sql.Result
-		res, err = db.Exec("INSERT INTO users (email, name, country) VALUES (?, ?, ?)", u.Email, u.Name, u.Country)
+		res, err = db.Exec(sc(r, "INSERT INTO users (email, name, country) VALUES (?, ?, ?)"), u.Email, u.Name, u.Country)
 		if err == nil {
 			u.ID, _ = res.LastInsertId()
 		}
@@ -377,7 +431,7 @@ func updateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	var u User
 	_ = json.NewDecoder(r.Body).Decode(&u)
-	res, err := db.Exec(q("UPDATE users SET name = ?, country = ? WHERE id = ?"), u.Name, u.Country, id)
+	res, err := db.Exec(sq(r, "UPDATE users SET name = ?, country = ? WHERE id = ?"), u.Name, u.Country, id)
 	if err != nil {
 		fail(w, 500, err.Error())
 		return
@@ -398,7 +452,7 @@ func deleteUser(w http.ResponseWriter, r *http.Request) {
 	var n int64
 	if dialect == "postgres" {
 		// planted: cascades scan unindexed orders.user_id and sessions.user_id
-		res, err := db.Exec("DELETE FROM users WHERE id = $1", id)
+		res, err := db.Exec(sc(r, "DELETE FROM users WHERE id = $1"), id)
 		if err != nil {
 			fail(w, 500, err.Error())
 			return
@@ -416,12 +470,12 @@ func deleteUser(w http.ResponseWriter, r *http.Request) {
 			"DELETE FROM orders WHERE user_id = ?",
 			"DELETE FROM sessions WHERE user_id = ?",
 		} {
-			if _, err := tx.Exec(s, id); err != nil {
+			if _, err := tx.Exec(sc(r, s), id); err != nil {
 				fail(w, 500, err.Error())
 				return
 			}
 		}
-		res, err := tx.Exec("DELETE FROM users WHERE id = ?", id)
+		res, err := tx.Exec(sc(r, "DELETE FROM users WHERE id = ?"), id)
 		if err != nil {
 			fail(w, 500, err.Error())
 			return
@@ -444,7 +498,7 @@ func userOrders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := intParam(r, "limit", 20, 1000)
-	rows, err := db.Query(q("SELECT id, user_id, status, total_cents, created_at FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT ?"), id, limit)
+	rows, err := db.Query(sq(r, "SELECT id, user_id, status, total_cents, created_at FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT ?"), id, limit)
 	if err != nil {
 		fail(w, 500, err.Error())
 		return
@@ -455,7 +509,7 @@ func userOrders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for i := range orders {
-		irows, err := db.Query(q("SELECT id, sku, qty, price_cents FROM order_items WHERE order_id = ?"), orders[i].ID)
+		irows, err := db.Query(sq(r, "SELECT id, sku, qty, price_cents FROM order_items WHERE order_id = ?"), orders[i].ID)
 		if err != nil {
 			fail(w, 500, err.Error())
 			return
@@ -476,7 +530,7 @@ func userOrders(w http.ResponseWriter, r *http.Request) {
 // planted: in-app O(k²) pairwise scoring
 func recommendations(w http.ResponseWriter, r *http.Request) {
 	limit := intParam(r, "limit", 20, 1000)
-	rows, err := db.Query(q("SELECT id, user_id, status, total_cents, created_at FROM orders ORDER BY id DESC LIMIT ?"), limit)
+	rows, err := db.Query(sq(r, "SELECT id, user_id, status, total_cents, created_at FROM orders ORDER BY id DESC LIMIT ?"), limit)
 	if err != nil {
 		fail(w, 500, err.Error())
 		return
@@ -513,7 +567,7 @@ func recommendations(w http.ResponseWriter, r *http.Request) {
 
 func listOrders(w http.ResponseWriter, r *http.Request) {
 	limit := intParam(r, "limit", 20, 1000)
-	rows, err := db.Query(q("SELECT id, user_id, status, total_cents, created_at FROM orders ORDER BY id DESC LIMIT ?"), limit)
+	rows, err := db.Query(sq(r, "SELECT id, user_id, status, total_cents, created_at FROM orders ORDER BY id DESC LIMIT ?"), limit)
 	if err != nil {
 		fail(w, 500, err.Error())
 		return
@@ -533,7 +587,7 @@ func searchOrders(w http.ResponseWriter, r *http.Request) {
 		status = "paid"
 	}
 	limit := intParam(r, "limit", 20, 1000)
-	rows, err := db.Query(q("SELECT id, user_id, status, total_cents, created_at FROM orders WHERE status = ? ORDER BY created_at DESC LIMIT ?"), status, limit)
+	rows, err := db.Query(sq(r, "SELECT id, user_id, status, total_cents, created_at FROM orders WHERE status = ? ORDER BY created_at DESC LIMIT ?"), status, limit)
 	if err != nil {
 		fail(w, 500, err.Error())
 		return
@@ -559,7 +613,7 @@ func salesReport(w http.ResponseWriter, r *http.Request) {
 	if dialect == "postgres" {
 		day = "date_trunc('day', created_at)"
 	}
-	rows, err := db.Query(q("SELECT "+day+" AS day, COUNT(*), SUM(total_cents) FROM orders WHERE created_at BETWEEN ? AND ? GROUP BY day ORDER BY day"), from, to)
+	rows, err := db.Query(sq(r, "SELECT "+day+" AS day, COUNT(*), SUM(total_cents) FROM orders WHERE created_at BETWEEN ? AND ? GROUP BY day ORDER BY day"), from, to)
 	if err != nil {
 		fail(w, 500, err.Error())
 		return
@@ -593,10 +647,10 @@ func createNote(w http.ResponseWriter, r *http.Request) {
 	}
 	var err error
 	if dialect == "postgres" {
-		err = db.QueryRow("INSERT INTO notes (user_id, body) VALUES ($1, $2) RETURNING id", n.UserID, n.Body).Scan(&n.ID)
+		err = db.QueryRow(sc(r, "INSERT INTO notes (user_id, body) VALUES ($1, $2) RETURNING id"), n.UserID, n.Body).Scan(&n.ID)
 	} else {
 		_ = db.QueryRow("SELECT UUID()").Scan(&n.ID)
-		_, err = db.Exec("INSERT INTO notes (id, user_id, body) VALUES (?, ?, ?)", n.ID, n.UserID, n.Body)
+		_, err = db.Exec(sc(r, "INSERT INTO notes (id, user_id, body) VALUES (?, ?, ?)"), n.ID, n.UserID, n.Body)
 	}
 	if err != nil {
 		fail(w, 500, err.Error())
@@ -607,7 +661,7 @@ func createNote(w http.ResponseWriter, r *http.Request) {
 
 func getNote(w http.ResponseWriter, r *http.Request) {
 	var n Note
-	err := db.QueryRow(q("SELECT id, user_id, body FROM notes WHERE id = ?"), r.PathValue("id")).Scan(&n.ID, &n.UserID, &n.Body)
+	err := db.QueryRow(sq(r, "SELECT id, user_id, body FROM notes WHERE id = ?"), r.PathValue("id")).Scan(&n.ID, &n.UserID, &n.Body)
 	if err == sql.ErrNoRows {
 		fail(w, 404, "not found")
 		return
@@ -621,7 +675,7 @@ func getNote(w http.ResponseWriter, r *http.Request) {
 func updateNote(w http.ResponseWriter, r *http.Request) {
 	var n Note
 	_ = json.NewDecoder(r.Body).Decode(&n)
-	res, err := db.Exec(q("UPDATE notes SET body = ? WHERE id = ?"), n.Body, r.PathValue("id"))
+	res, err := db.Exec(sq(r, "UPDATE notes SET body = ? WHERE id = ?"), n.Body, r.PathValue("id"))
 	if err != nil {
 		fail(w, 400, err.Error())
 		return
@@ -634,7 +688,7 @@ func updateNote(w http.ResponseWriter, r *http.Request) {
 }
 
 func deleteNote(w http.ResponseWriter, r *http.Request) {
-	res, err := db.Exec(q("DELETE FROM notes WHERE id = ?"), r.PathValue("id"))
+	res, err := db.Exec(sq(r, "DELETE FROM notes WHERE id = ?"), r.PathValue("id"))
 	if err != nil {
 		fail(w, 400, err.Error())
 		return
@@ -644,6 +698,199 @@ func deleteNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(204)
+}
+
+// planted: no index on events.kind; scans every partition
+func searchEvents(w http.ResponseWriter, r *http.Request) {
+	kind := r.URL.Query().Get("kind")
+	if kind == "" {
+		kind = "buy"
+	}
+	limit := intParam(r, "limit", 20, 1000)
+	rows, err := db.Query(sq(r, "SELECT id, user_id, kind, created_at FROM events WHERE kind = ? ORDER BY created_at DESC LIMIT ?"), kind, limit)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeRows(w, rows)
+}
+
+func userEvents(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		fail(w, 400, "bad id")
+		return
+	}
+	limit := intParam(r, "limit", 20, 1000)
+	rows, err := db.Query(sq(r, "SELECT id, user_id, kind, created_at FROM events WHERE user_id = ? ORDER BY created_at DESC LIMIT ?"), id, limit)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeRows(w, rows)
+}
+
+// planted: the view joins orders on an unindexed column
+func userTotals(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		fail(w, 400, "bad id")
+		return
+	}
+	rows, err := db.Query(sq(r, "SELECT id, email, orders, total_cents FROM user_order_totals WHERE id = ?"), id)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeRows(w, rows)
+}
+
+// planted: a join that scans both tables (cost grows with each)
+func ordersByCountry(w http.ResponseWriter, r *http.Request) {
+	country := r.URL.Query().Get("country")
+	if country == "" {
+		country = "US"
+	}
+	limit := intParam(r, "limit", 20, 1000)
+	rows, err := db.Query(sq(r, "SELECT o.id, o.user_id, o.status, o.total_cents, o.created_at FROM orders o JOIN users u ON u.id = o.user_id WHERE u.country = ? ORDER BY o.created_at DESC LIMIT ?"), country, limit)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	orders, err := scanOrders(rows)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, orders)
+}
+
+// a same-named table in another schema (Postgres) / database (MySQL)
+func archivedOrder(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		fail(w, 400, "bad id")
+		return
+	}
+	table := "archive.orders"
+	if dialect == "mysql" {
+		table = dbName + "_archive.orders"
+	}
+	rows, err := db.Query(sq(r, "SELECT id, user_id, status, total_cents, created_at FROM "+table+" WHERE id = ?"), id)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeRows(w, rows)
+}
+
+// cursor (keyset) pagination over events
+func eventFeed(w http.ResponseWriter, r *http.Request) {
+	limit := intParam(r, "limit", 20, 1000)
+	after, _ := strconv.ParseInt(r.URL.Query().Get("cursor"), 10, 64)
+	rows, err := db.Query(sq(r, "SELECT id, user_id, kind, created_at FROM events WHERE id > ? ORDER BY id LIMIT ?"), after, limit)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	defer rows.Close()
+	var items []map[string]any
+	var last int64
+	for rows.Next() {
+		var id, uid int64
+		var kind string
+		var at time.Time
+		if err := rows.Scan(&id, &uid, &kind, &at); err != nil {
+			fail(w, 500, err.Error())
+			return
+		}
+		items = append(items, map[string]any{"id": id, "user_id": uid, "kind": kind, "created_at": at})
+		last = id
+	}
+	resp := map[string]any{"items": items, "next_cursor": nil}
+	if len(items) == limit {
+		resp["next_cursor"] = strconv.FormatInt(last, 10)
+	}
+	writeJSON(w, 200, resp)
+}
+
+// form-encoded body
+func createSession(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	uid, err := strconv.ParseInt(r.PostForm.Get("user_id"), 10, 64)
+	if err != nil || r.PostForm.Get("token") == "" {
+		fail(w, 400, "user_id and token required")
+		return
+	}
+	if _, err := db.Exec(sq(r, "INSERT INTO sessions (user_id, token, created_at) VALUES (?, ?, ?)"), uid, r.PostForm.Get("token"), time.Now()); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 201, map[string]any{"ok": true})
+}
+
+// multipart upload
+func uploadAvatar(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		fail(w, 400, "bad id")
+		return
+	}
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	f, hdr, err := r.FormFile("file")
+	if err != nil {
+		fail(w, 400, "file required")
+		return
+	}
+	f.Close()
+	caption := r.FormValue("caption")
+	if len(caption) > 50 {
+		caption = caption[:50]
+	}
+	res, err := db.Exec(sq(r, "UPDATE users SET name = ? WHERE id = ?"), caption, id)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		fail(w, 404, "not found")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"bytes": hdr.Size})
+}
+
+// writeRows renders any result set as a JSON array of objects.
+func writeRows(w http.ResponseWriter, rows *sql.Rows) {
+	defer rows.Close()
+	cols, _ := rows.Columns()
+	out := []map[string]any{}
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			fail(w, 500, err.Error())
+			return
+		}
+		m := map[string]any{}
+		for i, c := range cols {
+			if b, ok := vals[i].([]byte); ok {
+				m[c] = string(b)
+			} else {
+				m[c] = vals[i]
+			}
+		}
+		out = append(out, m)
+	}
+	writeJSON(w, 200, out)
 }
 
 // planted: one INSERT per item
@@ -667,10 +914,10 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
 		o.Status = "pending"
 	}
 	if dialect == "postgres" {
-		err = tx.QueryRow("INSERT INTO orders (user_id, status, total_cents, created_at) VALUES ($1, $2, $3, now()) RETURNING id", o.UserID, o.Status, total).Scan(&o.ID)
+		err = tx.QueryRow(sc(r, "INSERT INTO orders (user_id, status, total_cents, created_at) VALUES ($1, $2, $3, now()) RETURNING id"), o.UserID, o.Status, total).Scan(&o.ID)
 	} else {
 		var res sql.Result
-		res, err = tx.Exec("INSERT INTO orders (user_id, status, total_cents, created_at) VALUES (?, ?, ?, NOW())", o.UserID, o.Status, total)
+		res, err = tx.Exec(sc(r, "INSERT INTO orders (user_id, status, total_cents, created_at) VALUES (?, ?, ?, NOW())"), o.UserID, o.Status, total)
 		if err == nil {
 			o.ID, _ = res.LastInsertId()
 		}
@@ -680,7 +927,7 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, it := range o.Items {
-		if _, err := tx.Exec(q("INSERT INTO order_items (order_id, sku, qty, price_cents) VALUES (?, ?, ?, ?)"), o.ID, it.SKU, it.Qty, it.PriceCents); err != nil {
+		if _, err := tx.Exec(sq(r, "INSERT INTO order_items (order_id, sku, qty, price_cents) VALUES (?, ?, ?, ?)"), o.ID, it.SKU, it.Qty, it.PriceCents); err != nil {
 			fail(w, 500, err.Error())
 			return
 		}
@@ -755,13 +1002,35 @@ const specJSON = `{
       "responses": {"200": {"description": "orders"}}}},
     "/notes": {"post": {"operationId": "createNote", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["user_id", "body"], "properties": {
         "user_id": {"type": "integer"}, "body": {"type": "string", "example": "remember the milk"}}}}}},
+      "responses": {"201": {"description": "created", "links": {
+        "GetNote": {"operationId": "getNote", "parameters": {"id": "$response.body#/id"}},
+        "UpdateNote": {"operationId": "updateNote", "parameters": {"id": "$response.body#/id"}},
+        "DeleteNote": {"operationId": "deleteNote", "parameters": {"id": "$response.body#/id"}}}}}}},
+    "/events/feed": {"get": {"operationId": "eventFeed", "parameters": [{"name": "cursor", "in": "query", "schema": {"type": "string"}}, {"$ref": "#/components/parameters/limit"}],
+      "responses": {"200": {"description": "a page of events and next_cursor"}}}},
+    "/sessions": {"post": {"operationId": "createSession", "requestBody": {"required": true, "content": {"application/x-www-form-urlencoded": {"schema": {"type": "object", "required": ["user_id", "token"], "properties": {
+        "user_id": {"type": "integer"}, "token": {"type": "string"}}}}}},
       "responses": {"201": {"description": "created"}}}},
+    "/users/{id}/avatar": {"post": {"operationId": "uploadAvatar", "parameters": [{"$ref": "#/components/parameters/id"}],
+      "requestBody": {"required": true, "content": {"multipart/form-data": {"schema": {"type": "object", "required": ["file"], "properties": {
+        "file": {"type": "string", "format": "binary"}, "caption": {"type": "string", "example": "me"}}}}}},
+      "responses": {"200": {"description": "stored"}}}},
     "/notes/{id}": {
       "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}],
       "get": {"operationId": "getNote", "responses": {"200": {"description": "note"}}},
       "put": {"operationId": "updateNote", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"body": {"type": "string", "example": "edited"}}}}}},
         "responses": {"200": {"description": "updated"}}},
       "delete": {"operationId": "deleteNote", "responses": {"204": {"description": "deleted"}}}},
+    "/events/search": {"get": {"operationId": "searchEvents", "parameters": [{"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["buy", "click", "view", "share"]}}, {"$ref": "#/components/parameters/limit"}],
+      "responses": {"200": {"description": "events"}}}},
+    "/users/{id}/events": {"get": {"operationId": "getUserEvents", "parameters": [{"$ref": "#/components/parameters/id"}, {"$ref": "#/components/parameters/limit"}],
+      "responses": {"200": {"description": "events"}}}},
+    "/users/{id}/totals": {"get": {"operationId": "getUserTotals", "parameters": [{"$ref": "#/components/parameters/id"}],
+      "responses": {"200": {"description": "order totals from a view"}}}},
+    "/orders/by-country": {"get": {"operationId": "ordersByCountry", "parameters": [{"name": "country", "in": "query", "schema": {"type": "string", "enum": ["US", "IN", "DE", "GB", "FR"]}}, {"$ref": "#/components/parameters/limit"}],
+      "responses": {"200": {"description": "orders"}}}},
+    "/archive/orders/{id}": {"get": {"operationId": "getArchivedOrder", "parameters": [{"$ref": "#/components/parameters/id"}],
+      "responses": {"200": {"description": "archived order"}}}},
     "/reports/sales": {"get": {"operationId": "salesReport", "parameters": [{"name": "from", "in": "query", "schema": {"type": "string", "format": "date"}, "example": "2000-01-01"}, {"name": "to", "in": "query", "schema": {"type": "string", "format": "date"}, "example": "2100-01-01"}],
       "responses": {"200": {"description": "daily sales"}}}}
   }

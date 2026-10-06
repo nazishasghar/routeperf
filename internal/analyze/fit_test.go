@@ -70,3 +70,29 @@ func TestFilterColsCasts(t *testing.T) {
 		t.Fatal(n)
 	}
 }
+
+func TestPolyDegree(t *testing.T) {
+	var mix, lin []Point
+	for _, k := range []float64{1, 10, 100, 250, 500, 1000} {
+		for r := 0; r < 3; r++ {
+			noise := float64(r-1) * 0.05
+			mix = append(mix, Point{k, 0.3 + 0.004*k + 0.00006*k*k + noise}) // k² term = 60ms of 64ms at k=1000
+			lin = append(lin, Point{k, 0.3 + 0.01*k + noise})
+		}
+	}
+	if d, share := PolyDegree(mix); d != 2 || share < 0.5 {
+		t.Errorf("mixture: degree %d share %.2f, want 2", d, share)
+	}
+	if d, _ := PolyDegree(lin); d != 1 {
+		t.Errorf("linear: degree %d, want 1", d)
+	}
+	if s, hw, ok := SlopeCI([]Point{{10, 10}, {100, 101}, {1000, 990}, {10, 11}, {100, 99}, {1000, 1010}}); !ok || s < 0.95 || s > 1.05 || hw > 0.05 {
+		t.Errorf("slope %.3f ± %.3f", s, hw)
+	}
+	if d, sure := Degree(1.02, 0.04); d != 1 || !sure {
+		t.Errorf("Degree(1.02±0.04) = %v %v", d, sure)
+	}
+	if _, sure := Degree(1.4, 0.8); sure {
+		t.Errorf("a wide interval must not be sure")
+	}
+}

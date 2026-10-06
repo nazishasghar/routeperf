@@ -1,0 +1,59 @@
+name: Bug report
+description: routeperf crashed, measured something wrong, or left the database changed
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please remove secrets (tokens, passwords, cookies) and real user data from anything you paste;
+        `routeperf run --mask-literals` writes reports without SQL literals.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and config
+      description: The exact command, and routeperf.yaml without secrets.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: Output of `routeperf check`
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: routeperf version
+      description: Output of `routeperf version`
+    validations:
+      required: true
+  - type: dropdown
+    id: db
+    attributes:
+      label: Database
+      options: [PostgreSQL, MySQL]
+    validations:
+      required: true
+  - type: input
+    id: dbversion
+    attributes:
+      label: Database version and how it runs
+      placeholder: "Postgres 17 in Docker / MySQL 8.4 via Homebrew / RDS through routeperf proxy"
+  - type: dropdown
+    id: api
+    attributes:
+      label: API description
+      options: [OpenAPI / Swagger, GraphQL, gRPC]
+  - type: textarea
+    id: report
+    attributes:
+      label: Relevant part of report.md or results.json
+      description: The endpoint or query section that looks wrong.
+      render: markdown
