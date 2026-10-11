@@ -410,7 +410,7 @@ routeperf run --role admin="$ADMIN_TOKEN" --role driver="$DRIVER_TOKEN" --as adm
 routeperf fills in request inputs automatically, in this order:
 1. Spec `example` / `default` / `enum` values.
 2. **OpenAPI links.** Values from earlier responses that the spec links to later operations (`POST /notes` → `$response.body#/id` → `DELETE /notes/{id}`). Writes use them to update and delete the resources routeperf created.
-3. Real IDs sampled from your database. It maps `{id}` on `/users/{id}`, or `user_id`, to `users.id` (and `/archive/orders/{id}` to `archive.orders`), and picks rows that exist at every data scale.
+3. Real IDs sampled from your database. It maps `{id}` on `/users/{id}`, or `user_id`, to `users.id` (and `/archive/orders/{id}` to `archive.orders`), and picks rows that exist at every data scale. `customerUuid` / `customer_uuid` map to `customers.uuid` (or the PK, when that's a uuid). A uuid input only takes uuid values, so an integer PK never lands in one.
 4. Values generated from the schema.
 
 Request bodies are sent as JSON, `application/x-www-form-urlencoded` or `multipart/form-data` (file fields with `format: binary` get a small generated file), whichever the spec declares first.
@@ -432,6 +432,8 @@ order.byUser:                     # GraphQL / tRPC / JSON-RPC: arguments by name
 user.byEmail:                     # a tRPC procedure whose whole input is one value
   input: "sql:SELECT email FROM users WHERE {anchor} LIMIT 1"
 ```
+
+`sql:` values resolve anywhere in a `body` or `input`, including inside lists (`lines: [{ itemId: "sql:…" }]`). When a list is the `k` knob, routeperf repeats its first item `k` times.
 
 Inputs that routeperf generated without a source are listed at the end of `report.md`. A `sql:` fixture that finds no row (or only NULL) is never sent as-is: the input falls back to the sources above and the report warns which fixture missed.
 

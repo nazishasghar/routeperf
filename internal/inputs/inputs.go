@@ -105,6 +105,11 @@ func New(d db.DB, tables map[string]*db.Table, fixtures map[string]Fixture, kpar
 
 var idName = regexp.MustCompile(`(?i)^(\w+?)_?id$`)
 
+// uuidName is an input that holds a row's uuid (customerUuid, customer_uuid).
+var uuidName = regexp.MustCompile(`(?i)^(\w+?)_?uuid$`)
+
+var uuidValue = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
 // tableFor guesses the table referenced by a parameter.
 func (r *Resolver) tableFor(name, path string) *db.Table {
 	try := func(base string) *db.Table {
@@ -126,6 +131,12 @@ func (r *Resolver) tableFor(name, path string) *db.Table {
 			}
 		}
 		return nil
+	}
+	// customerUuid → customers (idName would read it as "customerUu" + "id")
+	if m := uuidName.FindStringSubmatch(name); m != nil && m[1] != "" {
+		if t := try(m[1]); t != nil {
+			return t
+		}
 	}
 	if m := idName.FindStringSubmatch(name); m != nil && m[1] != "" {
 		if t := try(m[1]); t != nil {
@@ -153,7 +164,15 @@ func (r *Resolver) tableFor(name, path string) *db.Table {
 // Anchors returns PK values from the 1% nested subset so the same IDs exist
 // at every data-scale step.
 func (r *Resolver) Anchors(ctx context.Context, t *db.Table) []string {
+	return r.anchorValues(ctx, t, t.PK)
+}
+
+// anchorValues returns column col of the anchor rows, skipping NULLs.
+func (r *Resolver) anchorValues(ctx context.Context, t *db.Table, col string) []string {
 	key := t.Key
+	if col != t.PK {
+		key += "#" + col
+	}
 	if v, ok := r.anchors[key]; ok {
 		return v
 	}
@@ -161,14 +180,69 @@ func (r *Resolver) Anchors(ctx context.Context, t *db.Table) []string {
 		r.anchors[key] = nil
 		return nil
 	}
-	pk := r.DB.Quote(t.PK)
-	q := fmt.Sprintf("SELECT s.%s FROM %s s WHERE %s ORDER BY s.%s LIMIT 50", pk, t.SQL, r.anchorPred(t, "s", 0), pk)
+	c, pk := r.DB.Quote(col), r.DB.Quote(t.PK)
+	q := fmt.Sprintf("SELECT s.%s FROM %s s WHERE %s ORDER BY s.%s LIMIT 50", c, t.SQL, r.anchorPred(t, "s", 0), pk)
 	vals, err := r.DB.FirstValues(ctx, q)
 	if err != nil || len(vals) == 0 {
-		vals, _ = r.DB.FirstValues(ctx, fmt.Sprintf("SELECT %s FROM %s ORDER BY %s LIMIT 50", pk, t.SQL, pk))
+		vals, _ = r.DB.FirstValues(ctx, fmt.Sprintf("SELECT %s FROM %s ORDER BY %s LIMIT 50", c, t.SQL, pk))
 	}
-	r.anchors[key] = vals
-	return vals
+	var out []string
+	for _, v := range vals {
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	r.anchors[key] = out
+	return out
+}
+
+// idValues returns real values for an ID-like input: anchor PKs of the table
+// its name points at (user_id → users.id), or that table's uuid column for a
+// uuid name (customerUuid → customers.uuid). A uuid input, by name or format,
+// only takes uuid-shaped values, so an integer PK never lands in one; when the
+// PK isn't a uuid the table's uuid column is tried instead.
+func (r *Resolver) idValues(ctx context.Context, name, path string, s *openapi3.Schema) []string {
+	t := r.tableFor(name, path)
+	if t == nil {
+		return nil
+	}
+	byName := uuidName.MatchString(name) || strings.EqualFold(name, "uuid")
+	if !byName && (s == nil || s.Format != "uuid") {
+		return r.Anchors(ctx, t)
+	}
+	cols := []string{t.PK}
+	if uc := column(t, "uuid"); uc != "" && uc != t.PK {
+		if byName {
+			cols = []string{uc, t.PK}
+		} else {
+			cols = append(cols, uc)
+		}
+	}
+	for _, c := range cols {
+		var out []string
+		for _, v := range r.anchorValues(ctx, t, c) {
+			if uuidValue.MatchString(v) {
+				out = append(out, v)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return nil
+}
+
+// column returns t's column called name (any case), or "".
+func column(t *db.Table, name string) string {
+	for _, c := range t.Cols {
+		if strings.EqualFold(c, name) {
+			return c
+		}
+	}
+	if t.NotNull[strings.ToLower(name)] { // MySQL leaves DEFAULT (UUID()) columns out of Cols
+		return strings.ToLower(name)
+	}
+	return ""
 }
 
 // anchorPred mirrors subset membership: root tables by key hash, child tables
@@ -366,29 +440,41 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 				src = fx.args(op)
 			}
 			if v, ok := src[p.Name]; ok {
-				if fv, err := r.fixtureValue(ctx, v, iter); err == nil {
-					val, have = fv, true
-				} else {
-					r.fixtureMiss(op, p.In+":"+p.Name, err)
+				switch v.(type) {
+				case map[string]any, []any: // sql: values inside objects and lists too
+					val, have = r.resolveFixture(ctx, op, deepCopy(v), p.In, p.Name, iter), true
+				default:
+					if fv, err := r.fixtureValue(ctx, v, iter); err == nil {
+						val, have = fv, true
+					} else {
+						r.fixtureMiss(op, p.In+":"+p.Name, err)
+					}
 				}
 			}
 		}
 		if ki != nil && !ki.InBody && p.Name == ki.Name && k >= 0 {
-			val, have = k, true
 			if ki.Array {
-				item := r.gen(ctx, p.Schema.Items.Value, p.Name, opPath, iter, 1)
+				// k copies of the fixture's first item, as for a bulk body;
+				// generated from the schema without one
+				var first any
+				if arr, ok := val.([]any); ok && len(arr) > 0 {
+					first = arr[0]
+				} else {
+					first = r.gen(ctx, p.Schema.Items.Value, p.Name, opPath, iter, 1)
+				}
 				arr := make([]any, k)
 				for i := range arr {
-					arr[i] = uniquify(deepCopy(item), r.RunID, iter*10000+i, "")
+					arr[i] = uniquify(deepCopy(first), r.RunID, iter*10000+i, "")
 				}
 				val = arr
+			} else {
+				val = k
 			}
+			have = true
 		}
 		if !have && (p.In == "path" || idName.MatchString(p.Name) || p.In == "arg" && strings.EqualFold(p.Name, "id")) {
-			if t := r.tableFor(p.Name, opPath); t != nil {
-				if a := r.Anchors(ctx, t); len(a) > 0 {
-					val, have = a[iter%len(a)], true
-				}
+			if a := r.idValues(ctx, p.Name, opPath, p.Schema); len(a) > 0 {
+				val, have = a[iter%len(a)], true
 			}
 		}
 		if !have {
@@ -428,7 +514,7 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 		var body any
 		switch {
 		case fx.Body != nil:
-			body = r.resolveFixtureBody(ctx, op, deepCopy(fx.Body), "", iter)
+			body = r.resolveFixture(ctx, op, deepCopy(fx.Body), "body", "", iter)
 		case op.Body.Example != nil && authPath.MatchString(op.Path):
 			body = deepCopy(op.Body.Example) // credentials must stay exact
 		case op.Body.Example != nil:
@@ -468,19 +554,19 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 	return req, nil
 }
 
-// resolveFixtureBody resolves sql: values in a fixture body; one that finds
-// nothing falls back to an anchor ID when its key names a table (user_id),
-// and is null otherwise.
-func (r *Resolver) resolveFixtureBody(ctx context.Context, op *spec.Operation, v any, key string, iter int) any {
+// resolveFixture resolves sql: values anywhere in a fixture body or input
+// (in is "body", "arg", …); one that finds nothing falls back to an anchor
+// ID when its key names a table (user_id), and is null otherwise.
+func (r *Resolver) resolveFixture(ctx context.Context, op *spec.Operation, v any, in, key string, iter int) any {
 	switch x := v.(type) {
 	case map[string]any:
 		for k, vv := range x {
-			x[k] = r.resolveFixtureBody(ctx, op, vv, k, iter)
+			x[k] = r.resolveFixture(ctx, op, vv, in, k, iter)
 		}
 		return x
 	case []any:
 		for i, vv := range x {
-			x[i] = r.resolveFixtureBody(ctx, op, vv, key, iter)
+			x[i] = r.resolveFixture(ctx, op, vv, in, key, iter)
 		}
 		return x
 	case string:
@@ -488,12 +574,10 @@ func (r *Resolver) resolveFixtureBody(ctx context.Context, op *spec.Operation, v
 		if err == nil {
 			return fv
 		}
-		r.fixtureMiss(op, "body:"+key, err)
+		r.fixtureMiss(op, in+":"+key, err)
 		if key != "" && idName.MatchString(key) {
-			if t := r.tableFor(key, pathFor(op)); t != nil {
-				if a := r.Anchors(ctx, t); len(a) > 0 {
-					return numOrString(a[iter%len(a)])
-				}
+			if a := r.idValues(ctx, key, pathFor(op), nil); len(a) > 0 {
+				return numOrString(a[iter%len(a)])
 			}
 		}
 		return nil
@@ -507,11 +591,9 @@ func (r *Resolver) refreshIDs(ctx context.Context, v any, path string, iter int)
 	case map[string]any:
 		for k, vv := range x {
 			if _, isObj := vv.(map[string]any); !isObj && idName.MatchString(k) && !strings.EqualFold(k, "id") {
-				if t := r.tableFor(k, path); t != nil {
-					if a := r.Anchors(ctx, t); len(a) > 0 {
-						x[k] = numOrString(a[iter%len(a)])
-						continue
-					}
+				if a := r.idValues(ctx, k, path, nil); len(a) > 0 {
+					x[k] = numOrString(a[iter%len(a)])
+					continue
 				}
 			}
 			x[k] = r.refreshIDs(ctx, vv, path, iter)
@@ -586,10 +668,8 @@ func (r *Resolver) gen(ctx context.Context, s *openapi3.Schema, name, path strin
 	switch {
 	case s.Type.Is("integer"), s.Type.Is("number"):
 		if idName.MatchString(name) && (!strings.EqualFold(name, "id") || strings.Contains(path, "{id}")) {
-			if t := r.tableFor(name, path); t != nil {
-				if a := r.Anchors(ctx, t); len(a) > 0 {
-					return numOrString(a[iter%len(a)])
-				}
+			if a := r.idValues(ctx, name, path, s); len(a) > 0 {
+				return numOrString(a[iter%len(a)])
 			}
 		}
 		if s.Min != nil {
@@ -628,11 +708,12 @@ func (r *Resolver) gen(ctx context.Context, s *openapi3.Schema, name, path strin
 	if s.Format == "binary" || s.Format == "byte" && strings.Contains(strings.ToLower(name), "file") {
 		return []byte(fmt.Sprintf("routeperf test file %s %d\n", r.RunID, iter))
 	}
-	if idName.MatchString(name) && s.Format != "uuid" && (!strings.EqualFold(name, "id") || strings.Contains(path, "{id}")) {
-		if t := r.tableFor(name, path); t != nil {
-			if a := r.Anchors(ctx, t); len(a) > 0 {
-				return a[iter%len(a)]
-			}
+	// a uuid "id" is likely a new row's own key (stays random); references
+	// such as customerId or itemUuid take real values
+	ownKey := strings.EqualFold(name, "id") && (!strings.Contains(path, "{id}") || s.Format == "uuid")
+	if idName.MatchString(name) && !ownKey {
+		if a := r.idValues(ctx, name, path, s); len(a) > 0 {
+			return a[iter%len(a)]
 		}
 	}
 	var v string
