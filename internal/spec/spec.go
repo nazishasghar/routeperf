@@ -43,10 +43,11 @@ type Operation struct {
 	Depth       int
 	Phase       string // R or W
 	Links       []Link // OpenAPI response links to other operations
-	Protocol    string // "" / http | graphql | grpc
+	Protocol    string // "" / http | graphql | grpc | trpc | jsonrpc | connect | twirp
 	Unsupported string // reason the operation can't be called
 	GraphQL     *GraphQLOp
 	GRPC        *GRPCOp
+	RPC         *RPCOp
 }
 
 // Link is an OpenAPI 3 response link: values from this operation's response
@@ -402,4 +403,13 @@ type GRPCOp struct {
 	FullMethod string // /pkg.Service/Method
 	Input      any    // protoreflect.MessageDescriptor (kept untyped to avoid importing protobuf here)
 	Output     any
+}
+
+// RPCOp describes a procedure called over HTTP: a tRPC procedure, a JSON-RPC
+// method, or a Connect/Twirp unary method.
+type RPCOp struct {
+	Name string   // tRPC path (user.byId), JSON-RPC method, or pkg.Service/Method
+	Kind string   // tRPC: query | mutation
+	Wrap string   // how "arg" params become the input: object (its properties), value (one arg is the whole input), array (JSON-RPC by-position), none
+	Args []string // declared argument order (array)
 }

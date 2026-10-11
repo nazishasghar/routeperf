@@ -8,12 +8,12 @@
   <img alt="Go" src="https://img.shields.io/github/go-mod/go-version/nazishasghar/routeperf?color=00ADD8">
   <img alt="PostgreSQL 13+" src="https://img.shields.io/badge/PostgreSQL-13%2B-336791?logo=postgresql&logoColor=white">
   <img alt="MySQL 8.0.18+" src="https://img.shields.io/badge/MySQL-8.0.18%2B-4479A1?logo=mysql&logoColor=white">
-  <img alt="OpenAPI · GraphQL · gRPC" src="https://img.shields.io/badge/OpenAPI%20%C2%B7%20GraphQL%20%C2%B7%20gRPC-555">
+  <img alt="OpenAPI · GraphQL · gRPC · tRPC · JSON-RPC · Connect · Twirp" src="https://img.shields.io/badge/OpenAPI%20%C2%B7%20GraphQL%20%C2%B7%20gRPC%20%C2%B7%20tRPC%20%C2%B7%20JSON--RPC%20%C2%B7%20Connect%20%C2%B7%20Twirp-555">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-555"></a>
 </p>
 
 <p align="center">
-  <b>Point it at your API (OpenAPI, GraphQL or gRPC), the running service and its database.<br>
+  <b>Point it at your API (OpenAPI, GraphQL, gRPC, tRPC, JSON-RPC, Connect or Twirp), the running service and its database.<br>
   Get latency, DB time, queries per request, an estimated Big O and a proven fix for every endpoint.</b>
 </p>
 
@@ -46,7 +46,7 @@ For each endpoint, routeperf:
 - replays that SQL with `EXPLAIN ANALYZE` on 1%→100% copies of your data, and one table at a time, so the growth curve shows the Big O and which table drives it
 - reports what to fix (missing indexes, N+1 queries, unindexed foreign keys, O(k²) loops in app code) and proves index fixes with hypothetical indexes before suggesting them
 
-Works with **PostgreSQL 13+** and **MySQL 8.0.18+**, for **OpenAPI/Swagger**, **GraphQL** and **gRPC** APIs, on macOS, Linux and Windows.
+Works with **PostgreSQL 13+** and **MySQL 8.0.18+**, for **OpenAPI/Swagger**, **GraphQL**, **gRPC** and procedure-style **tRPC**, **JSON-RPC 2.0**, **Connect** and **Twirp** APIs, on macOS, Linux and Windows.
 
 ---
 
@@ -54,7 +54,7 @@ Works with **PostgreSQL 13+** and **MySQL 8.0.18+**, for **OpenAPI/Swagger**, **
 - [Quick start](#quick-start)
 - [What your setup needs](#what-your-setup-needs) · [No admin rights? Proxy capture](#no-admin-rights-proxy-capture)
 - [Configuration](#configuration) · [Authentication](#authentication) · [Inputs and fixtures](#inputs-and-fixtures)
-- [GraphQL and gRPC](#graphql-and-grpc)
+- [GraphQL and gRPC](#graphql-and-grpc) · [tRPC, JSON-RPC, Connect and Twirp](#trpc-json-rpc-connect-and-twirp)
 - [Commands](#commands)
 - [Reading the report](#reading-the-report)
 - [Cold cache](#cold-cache) · [Load mode](#load-mode) · [Sharing reports safely](#sharing-reports-safely)
@@ -194,7 +194,7 @@ routeperf run --spec http://localhost:3000/swagger.json --api-url http://localho
 ## What your setup needs
 
 1. **The API running** where routeperf can reach it, connected to the database you pass as `--db-url`. `check` confirms that the API's SQL really lands in that database.
-2. **An API description**: a Swagger 2.0 / OpenAPI 3.x document (URL or file, JSON or YAML), a GraphQL endpoint or SDL file, or a gRPC server with reflection (or its `.proto` files). See [GraphQL and gRPC](#graphql-and-grpc).
+2. **An API description**: a Swagger 2.0 / OpenAPI 3.x document (URL or file, JSON or YAML), a GraphQL endpoint or SDL file, a gRPC server with reflection (or its `.proto` files), a tRPC router file, a JSON-RPC endpoint or OpenRPC document, or the `.proto` files of a Connect/Twirp service. See [GraphQL and gRPC](#graphql-and-grpc) and [tRPC, JSON-RPC, Connect and Twirp](#trpc-json-rpc-connect-and-twirp).
 3. **A disposable database with realistic bulk data.**
    - Big O is measured from how work grows, so main tables need at least ~10k rows; 100k+ is better.
    - Remote hosts are refused unless you pass `--allow-remote-db`.
@@ -243,7 +243,8 @@ Precedence is **flags > `routeperf.yaml` > environment**. The config file is rea
 A fully commented template is in [`routeperf.example.yaml`](routeperf.example.yaml); `routeperf init` writes one for you. The most-used keys:
 
 ```yaml
-spec: http://localhost:3000/swagger.json   # or a GraphQL endpoint / .graphql file, or grpc://host:port / .proto files
+spec: http://localhost:3000/swagger.json   # or a GraphQL endpoint / .graphql file, grpc://host:port / .proto files,
+                                           # a tRPC router (src/server/api/root.ts), jsonrpc:http://host/rpc / openrpc.json, connect://host:port
 api: { base_url: http://localhost:3000, timeout: 30s }
 db:
   url: "${DATABASE_URL}"
@@ -381,6 +382,10 @@ createOrder:
   body:
     user_id: "sql:SELECT id FROM users WHERE {anchor} LIMIT 1"
     items: [{ sku: ABC-1, qty: 2 }]
+order.byUser:                     # GraphQL / tRPC / JSON-RPC: arguments by name under input:
+  input: { userId: "sql:SELECT id FROM users WHERE {anchor} LIMIT 1", status: paid }
+user.byEmail:                     # a tRPC procedure whose whole input is one value
+  input: "sql:SELECT email FROM users WHERE {anchor} LIMIT 1"
 ```
 
 Inputs that routeperf generated without a source are listed at the end of `report.md`. A `sql:` fixture that finds no row (or only NULL) is never sent as-is: the input falls back to the sources above and the report warns which fixture missed.
@@ -422,6 +427,47 @@ routeperf run --spec api/shop.proto,api/common.proto --api-url grpc://localhost:
 - Requests are built from the message schema; `page_size`/`limit` fields are `k`, `*_id` fields get real IDs.
 - Auth goes in metadata: the bearer token as `authorization`, custom headers as metadata keys.
 - Use `grpcs://` (or `api.grpc.tls: true`) for TLS.
+- Methods with `option idempotency_level = NO_SIDE_EFFECTS;` count as reads whatever their name.
+
+---
+
+## tRPC, JSON-RPC, Connect and Twirp
+
+Procedure-style APIs are measured like the rest: every procedure is called with generated (or fixture) input, its SQL captured and replayed at scale. Their operations show up as `QUERY user.byId`, `MUTATION user.create` (tRPC) and `RPC user_get`, `RPC Shop/GetUser` (JSON-RPC, Connect, Twirp).
+
+**tRPC.** tRPC has no runtime schema, so routeperf loads your router with Node and reads every procedure and its input validator:
+
+```bash
+routeperf run --spec src/server/api/root.ts --api-url http://localhost:3000 --db-url postgres://me@localhost:5432/app -b "next-auth.session-token=$SESSION"
+routeperf run --spec src/server/router.ts#appRouter …        # name the export when the file exports several routers
+```
+
+- Works with tRPC v10 and v11 (lazy routers included) and zod v3/v4; other validators work when they expose Standard Schema's JSON Schema hook. `.ts` files run through `npx tsx` (set `api.trpc.command`, e.g. `pnpm exec tsx`, to use another loader); `.js`/`.mjs` files run with `node`. The router module is imported: `.env`/`.env.local` are loaded first and `SKIP_ENV_VALIDATION=1` is set (create-t3-app), but top-level code such as DB clients still runs.
+- No Node in CI? Write the procedure list once with `routeperf trpc-manifest src/server/api/root.ts` and pass the file: `--spec routeperf.trpc.json`.
+- The endpoint is `api.trpc.path` (default `/trpc`; Next.js apps use `/api/trpc`). Queries are sent as `GET /trpc/<path>?input=…`, mutations as `POST`. A superjson transformer is detected from the router and its `{"json": …}` envelope is added and removed for you.
+- Every query is a read and every mutation a write; subscriptions are skipped. Procedures are tagged with their router namespace (`--only tag:user`).
+- Input fields map like GraphQL arguments: `limit`/`take`/`pageSize` are `k`, `id`/`userId` get real IDs from the database (`user.byId({ id })` → `users`), a list of objects (`order.create({ items: […] })`) is a bulk `k`, optional fields stay unset, and a `cursor` field is followed through `nextCursor` (infinite queries).
+
+**JSON-RPC 2.0.** Point `--spec` at the endpoint (it answers OpenRPC's `rpc.discover`), or at an OpenRPC document:
+
+```bash
+routeperf run --spec jsonrpc:http://localhost:8545/rpc --db-url postgres://me@localhost:5432/app --token "$API_TOKEN"
+routeperf run --spec openrpc.json --api-url http://localhost:8545 --db-url …      # endpoint: api.jsonrpc.path, else the document's servers[0]
+```
+
+- Params go by name when a method declares `paramStructure: by-name`, else by position; `api.jsonrpc.params_by: by-name | by-position` overrides that.
+- Methods named `get…`, `list…`, `search…` (also `user_get`, `user.list`) are reads; `x-readonly: true` or `x-side-effects: false` on a method says so explicitly.
+- JSON-RPC errors arrive as HTTP 200; routeperf maps them to a status (`-32601` → 404, `-32602` → 400, `-32603` → 500, "unauthorized" → 401, …) so failures show up in the report.
+
+**Connect and Twirp.** Pass the `.proto` files and the HTTP address; Connect services that serve gRPC reflection (`connectrpc.com/grpcreflect`) need no files:
+
+```bash
+routeperf run --protocol connect --spec api/shop.proto --api-url http://localhost:8080 --db-url …
+routeperf run --spec connect://localhost:8080 --db-url …                        # Connect with reflection on the same port
+routeperf run --protocol twirp --spec api/shop.proto --api-url http://localhost:8080 --db-url …   # routes under api.rpc_prefix (default /twirp)
+```
+
+- Calls are unary JSON over HTTP (`POST /pkg.Service/Method`, with `Connect-Protocol-Version: 1` for Connect); auth uses the usual HTTP credentials. Operations, reads and `k` are found as for gRPC.
 
 ---
 
@@ -438,6 +484,7 @@ routeperf run --spec api/shop.proto,api/common.proto --api-url grpc://localhost:
 | `routeperf diff base.json new.json` | Compares two runs; exit code 2 when an endpoint got worse ([CI](#ci)) |
 | `routeperf report results.json` | Re-prints the table and re-writes `report.md` and `report.html` from a saved JSON (add `--mask-literals` to strip values) |
 | `routeperf repair` | Cleans up after a killed run: log settings, data snapshot, temporary schemas |
+| `routeperf trpc-manifest <router.ts>` | Writes a tRPC router's procedures and input schemas to `routeperf.trpc.json`, for runs where Node can't load the router |
 | `routeperf version` | Version info |
 | `routeperf completion zsh\|bash\|fish\|powershell` | Shell completion |
 
@@ -445,7 +492,7 @@ Useful `run` flags:
 
 | Flag | Effect |
 |---|---|
-| `--no-writes` | GET/HEAD only (GraphQL queries, gRPC reads) |
+| `--no-writes` | GET/HEAD only (GraphQL and tRPC queries, RPC reads) |
 | `-y`, `--yes` | don't ask before running write operations (required in non-interactive shells) |
 | `--only <ids>`, `--exclude <ids>` | operationIds, `tag:<name>`, `"METHOD /path"` or path globs (`/admin/**`) |
 | `--no-scale` | skip the scaling experiments; plan-only Big O, faster but lower confidence |
@@ -606,6 +653,8 @@ GET /users/{id}/orders                       O(k·log n_order_items)       O(k·
 | `Spec ✗ 401` | The spec endpoint needs auth: configure auth (it is applied to the spec request too), or pass a local file |
 | `Spec ✗ introspection …` (GraphQL) | Enable introspection in development, or pass the `.graphql` SDL file |
 | `Spec ✗ server reflection …` (gRPC) | Register reflection on the server, or pass the `.proto` files |
+| `Spec ✗ loading the tRPC router …` | Run it yourself to see the error: `npx tsx` must be able to import the router file (path aliases come from `tsconfig.json`; required env vars from `.env`). Set `api.trpc.command`, or write a manifest with `routeperf trpc-manifest` where it works |
+| `Spec ✗ rpc.discover …` (JSON-RPC) | The server has no OpenRPC discovery: write an `openrpc.json` and pass it |
 | `DB connect ✗ database "x" does not exist` | Fix the database name in `--db-url` |
 | `DB privileges ✗ role is not superuser` (Postgres) | Use a superuser on the local DB, e.g. `postgres://postgres@localhost:5432/app`, or use `--capture proxy` |
 | `SQL capture ✗ cannot locate the Postgres server log` | `--pg-log-file /path/to/server.log`, or `--pg-log-file docker:<container>`, or enable `logging_collector`, or use `--capture proxy` |
@@ -630,7 +679,8 @@ GET /users/{id}/orders                       O(k·log n_order_items)       O(k·
 - Without sqlcommenter tags, SQL is attributed by time window, so measurements send one request at a time and exclude background SQL by query shape. An endpoint that runs exactly the same query shape as a background job can lose that statement from its count. Load mode can attribute SQL per endpoint only with sqlcommenter tags.
 - Proxy capture: the app must connect without TLS to the proxy, and MySQL clients that require TLS (or `caching_sha2_password` full authentication without RSA key retrieval) can't use it. The proxy can use TLS to a Postgres server.
 - Per-table scaling covers tables a query references directly; tables read through a view or a foreign-key cascade are scaled together with the rest.
-- GraphQL subscriptions and gRPC streaming methods are skipped.
+- GraphQL and tRPC subscriptions, and gRPC/Connect streaming methods, are skipped.
+- tRPC: transformers other than superjson aren't supported, and inputs routeperf can't convert to JSON Schema (custom validators without Standard Schema's JSON Schema hook) are sent as `{}` unless a fixture gives them. tRPC routers must be importable by Node.
 
 ---
 
@@ -649,13 +699,13 @@ bin/routeperf run --spec http://localhost:8088/swagger.json --api-url http://loc
   --db-url postgres://localhost:5432/routeperf_testbed --token testtoken
 ```
 
-The integration suite runs in CI on every push, against Postgres 17 and MySQL 8.4 service containers. It has three scenarios: the full run over the testbed (`TestEndToEnd`), proxy capture with sqlcommenter attribution, load mode and masking (`TestProxyAndLoad`), and the GraphQL and gRPC APIs (`TestGraphQLAndGRPC`).
+The integration suite runs in CI on every push, against Postgres 17 and MySQL 8.4 service containers. It has four scenarios: the full run over the testbed (`TestEndToEnd`), proxy capture with sqlcommenter attribution, load mode and masking (`TestProxyAndLoad`), the GraphQL and gRPC APIs (`TestGraphQLAndGRPC`), and the procedure-style APIs: tRPC plain and superjson, JSON-RPC via discovery and via a file, Connect and Twirp (`TestRPCProtocols`).
 
 The testbed supports MySQL as well (`--db-url mysql://root@127.0.0.1:3306/routeperf_testbed`). It accepts `Bearer testtoken`, `X-Api-Key: testkey`, cookie `session=testsession`, or `POST /auth/login` with `{"email":"perf@test.dev","password":"secret"}`. Its planted problems are:
 - background job noise (`--background-noise 120ms`)
 - UUID primary keys (`/notes`, with OpenAPI links from `POST /notes`)
 - an unindexed filter, also on a partitioned table with a composite key (`/events/search`)
-- an N+1 query, in REST (`/users/{id}/orders`) and in a GraphQL nested resolver (`users { notes }`)
+- an N+1 query, in REST (`/users/{id}/orders`), in a GraphQL nested resolver (`users { notes }`), in tRPC (`order.byUser`) and JSON-RPC (`orders_listByUser`)
 - an unindexed FK cascade
 - a view over an unindexed join (`/users/{id}/totals`)
 - a join that scans two tables (`/orders/by-country`)
@@ -666,6 +716,8 @@ The testbed supports MySQL as well (`--db-url mysql://root@127.0.0.1:3306/routep
 - cursor pagination, form and multipart bodies
 - a 10-connection pool (visible in load mode)
 - gRPC methods (`--grpc-addr`) and a GraphQL endpoint (`/graphql`)
+- tRPC procedures (`/trpc`, and `/trpc-sj` with superjson; manifests at `/routeperf.trpc.json` and `/superjson.trpc.json`), JSON-RPC 2.0 (`/rpc`, with `rpc.discover` and `/openrpc.json`), and the gRPC service over Connect (`/routeperf.testbed.Shop/…`) and Twirp (`/twirp/…`, `.proto` at `/shop.proto`)
+- keyset pagination with a filter whose work is bounded by `LIMIT` (`order.search`)
 
 Layout:
 
@@ -673,7 +725,8 @@ Layout:
 cmd/routeperf/        CLI (cobra): commands, prompts
 internal/spec         Swagger 2.0 / OpenAPI 3 → operation catalog (bodies, links)
 internal/gql          GraphQL schema (introspection / SDL) → operations and documents
-internal/grpcspec     gRPC services (reflection / .proto) → operations and request schemas
+internal/grpcspec     gRPC services (reflection / .proto) → operations and request schemas (also Connect, Twirp)
+internal/rpcspec      tRPC routers (Node extractor / manifest), OpenRPC → operations; JSON Schema → input schemas
 internal/auth         bearer, token commands, headers, cookies, login, OAuth2; scheme mapping; redaction
 internal/inputs       request building: fixtures, links, cursors, examples, anchor IDs, form/multipart
 internal/sqlutil      SQL parsing (libpg_query via WebAssembly, Vitess), fingerprints, rewriting
@@ -684,7 +737,7 @@ internal/analyze      curve fits and confidence intervals, plan algebra, verdict
 internal/runner       doctor (check), run lifecycle, replay, per-table scaling, cold cache, load
 internal/report       terminal, Markdown, HTML, JSON; literal masking
 internal/diff         run-to-run comparison for CI
-testbed/              sample API (REST, GraphQL, gRPC) with planted problems
+testbed/              sample API (REST, GraphQL, gRPC, tRPC, JSON-RPC, Connect, Twirp) with planted problems
 integration/          end-to-end tests against real Postgres + MySQL (go test -tags integration)
 ```
 

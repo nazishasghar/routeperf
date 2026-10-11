@@ -205,7 +205,7 @@ func Operations(services []protoreflect.ServiceDescriptor, title string) (*spec.
 			m := ms.Get(i)
 			full := fmt.Sprintf("/%s/%s", sd.FullName(), m.Name())
 			o := &spec.Operation{ID: string(m.Name()), Method: "RPC", Path: fmt.Sprintf("%s/%s", sd.Name(), m.Name()), Protocol: "grpc", Phase: "W", Depth: 1}
-			if readVerb.MatchString(string(m.Name())) {
+			if readVerb.MatchString(string(m.Name())) || noSideEffects(m) {
 				o.Phase = "R"
 			}
 			o.Resource = strings.ToLower(verbs.ReplaceAllString(string(m.Name()), ""))
@@ -220,6 +220,12 @@ func Operations(services []protoreflect.ServiceDescriptor, title string) (*spec.
 	}
 	sort.Slice(sp.Ops, func(i, j int) bool { return sp.Ops[i].Path < sp.Ops[j].Path })
 	return sp, methods
+}
+
+// noSideEffects reports `option idempotency_level = NO_SIDE_EFFECTS;`.
+func noSideEffects(m protoreflect.MethodDescriptor) bool {
+	opts, ok := m.Options().(*descriptorpb.MethodOptions)
+	return ok && opts.GetIdempotencyLevel() == descriptorpb.MethodOptions_NO_SIDE_EFFECTS
 }
 
 // Schema converts a message descriptor to an OpenAPI schema using protojson

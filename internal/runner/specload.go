@@ -8,14 +8,27 @@ import (
 	"github.com/nazishasghar/routeperf/internal/spec"
 )
 
-// protocol is the API style: openapi (default), graphql or grpc.
+// protocol is the API style: openapi (default), graphql, grpc, trpc,
+// jsonrpc, connect or twirp.
 func (r *Runner) protocol() string {
 	c := r.cfg
 	if c.API.Protocol != "" {
-		return strings.ToLower(c.API.Protocol)
+		p := strings.ToLower(c.API.Protocol)
+		if p == "json-rpc" || p == "openrpc" {
+			p = "jsonrpc"
+		}
+		return p
 	}
 	s := strings.ToLower(c.Spec)
 	switch {
+	case strings.HasPrefix(s, "trpc:") || isTSFile(strings.SplitN(s, "#", 2)[0]) || strings.HasSuffix(s, ".trpc.json"):
+		return "trpc"
+	case strings.HasPrefix(s, "jsonrpc:") || strings.HasPrefix(s, "openrpc:") || strings.HasSuffix(s, "openrpc.json"):
+		return "jsonrpc"
+	case strings.HasPrefix(s, "connect://") || strings.HasPrefix(s, "connects://") || strings.HasPrefix(s, "connect:"):
+		return "connect"
+	case strings.HasPrefix(s, "twirp:"):
+		return "twirp"
 	case strings.HasPrefix(s, "grpc://") || strings.HasPrefix(s, "grpcs://") || strings.HasSuffix(s, ".proto"):
 		return "grpc"
 	case strings.HasPrefix(s, "graphql:") || strings.HasSuffix(s, ".graphql") || strings.HasSuffix(s, ".graphqls") ||
@@ -32,8 +45,16 @@ func (r *Runner) loadSpec(ctx context.Context, add addFn) bool {
 	switch r.protocol() {
 	case "graphql":
 		return r.loadGraphQL(ctx, add)
-	case "grpc":
+	case "grpc", "connect", "twirp":
 		return r.loadGRPC(ctx, add)
+	case "trpc":
+		return r.loadTRPC(ctx, add)
+	case "jsonrpc":
+		return r.loadJSONRPC(ctx, add)
+	case "openapi":
+	default:
+		add("Spec", "fail", "unknown protocol "+r.protocol(), "use openapi, graphql, grpc, trpc, jsonrpc, connect or twirp")
+		return false
 	}
 	c := r.cfg
 	data, err := r.fetch(ctx, c.Spec)
