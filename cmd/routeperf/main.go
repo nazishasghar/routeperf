@@ -25,6 +25,7 @@ import (
 	"github.com/nazishasghar/routeperf/internal/diff"
 	"github.com/nazishasghar/routeperf/internal/proxy"
 	"github.com/nazishasghar/routeperf/internal/report"
+	"github.com/nazishasghar/routeperf/internal/rpcspec"
 	"github.com/nazishasghar/routeperf/internal/runner"
 	"github.com/nazishasghar/routeperf/internal/spec"
 	"github.com/nazishasghar/routeperf/internal/version"
@@ -48,9 +49,9 @@ var f flags
 func main() {
 	root := &cobra.Command{
 		Use:   "routeperf",
-		Short: "Per-endpoint performance and Big O from an OpenAPI, GraphQL or gRPC API + EXPLAIN ANALYZE",
-		Long: `routeperf calls every endpoint of your API (from its OpenAPI spec, GraphQL schema or gRPC
-service), captures the SQL each one runs on Postgres/MySQL (from the server log, or through its
+		Short: "Per-endpoint performance and Big O from an OpenAPI, GraphQL, gRPC, tRPC, JSON-RPC, Connect or Twirp API + EXPLAIN ANALYZE",
+		Long: `routeperf calls every endpoint of your API (from its OpenAPI spec, GraphQL schema, gRPC/Connect/Twirp
+service, tRPC router or JSON-RPC OpenRPC document), captures the SQL each one runs on Postgres/MySQL (from the server log, or through its
 wire proxy when you have no admin rights), replays it with EXPLAIN ANALYZE on 1%→100% data
 subsets and reports latency, DB time, queries/request, an estimated Big O and proven fixes.
 
@@ -73,7 +74,8 @@ Start with:  routeperf init   →   routeperf check   →   routeperf run`,
 	}
 	pf := root.PersistentFlags()
 	pf.StringVarP(&f.config, "config", "c", defCfg, "config file (env ROUTEPERF_CONFIG)")
-	pf.StringVar(&f.spec, "spec", "", "API description: OpenAPI URL/file, GraphQL endpoint or .graphql file, grpc://host:port or .proto files")
+	pf.StringVar(&f.spec, "spec", "", "API description: OpenAPI URL/file, GraphQL endpoint or .graphql file, grpc://host:port or .proto files, "+
+		"tRPC router file (root.ts) or manifest, jsonrpc:http://host/rpc or openrpc.json, connect://host:port")
 	pf.StringVar(&f.api, "api-url", "", "API base URL")
 	pf.StringVar(&f.dbURL, "db-url", "", "database URL (postgres://… or mysql://…)")
 	pf.StringVar(&f.token, "token", "", "bearer token")
@@ -89,7 +91,7 @@ Start with:  routeperf init   →   routeperf check   →   routeperf run`,
 	pf.StringSliceVar(&f.dbSchemas, "db-schemas", nil, "MySQL: other databases the app reads (Postgres sees every schema)")
 	pf.StringVar(&f.capture, "capture", "", "how SQL is captured: log (server statement log; needs admin) | proxy (wire proxy; no admin rights)")
 	pf.StringVar(&f.proxyListen, "proxy-listen", "", "proxy capture: address the app connects to instead of the DB (default 127.0.0.1:6543)")
-	pf.StringVar(&f.protocol, "protocol", "", "API description: openapi | graphql | grpc (auto-detected from --spec)")
+	pf.StringVar(&f.protocol, "protocol", "", "API description: openapi | graphql | grpc | trpc | jsonrpc | connect | twirp (auto-detected from --spec)")
 	pf.BoolVar(&f.mask, "mask-literals", false, "replace SQL literals and parameters with ? in every report")
 	pf.BoolVar(&f.nonInter, "non-interactive", false, "never prompt")
 	pf.BoolVarP(&f.verbose, "verbose", "v", false, "verbose logs")
@@ -132,10 +134,13 @@ routeperf with --capture proxy in another terminal.`, RunE: cmdProxy}
 	diffCmd.Flags().Float64Var(&f.diffQ, "queries", 1, "fail when queries/request grow by at least this much")
 	diffCmd.Flags().StringSliceVar(&f.diffFailOn, "fail-on", []string{"bigo", "p95", "queries", "nplusone", "status"}, "regressions that fail: bigo,p95,queries,nplusone,status,missing")
 	diffCmd.Flags().StringVarP(&f.diffOut, "out", "o", "", "also write a Markdown summary (for a PR comment)")
+	trpcCmd := &cobra.Command{Use: "trpc-manifest <router file>[#export]", Short: "Write a tRPC router's procedures and input schemas to a file, for runs without Node (--spec file.trpc.json)",
+		Example: "  routeperf trpc-manifest src/server/api/root.ts\n  routeperf trpc-manifest src/server/router.ts#appRouter -o api.trpc.json", Args: cobra.ExactArgs(1), RunE: cmdTRPCManifest}
+	trpcCmd.Flags().StringVarP(&f.out, "out", "o", "", "output file (default routeperf.trpc.json)")
 	versionCmd := &cobra.Command{Use: "version", Short: "Print the routeperf version", Run: func(*cobra.Command, []string) {
 		fmt.Println("routeperf", version.String())
 	}}
-	root.AddCommand(runCmd, proxyCmd, loadCmd, checkCmd, discoverCmd, initCmd, repairCmd, reportCmd, diffCmd, versionCmd)
+	root.AddCommand(runCmd, proxyCmd, loadCmd, checkCmd, discoverCmd, initCmd, repairCmd, reportCmd, diffCmd, trpcCmd, versionCmd)
 
 	report.Color = isTTY(os.Stdout)
 	if err := root.Execute(); err != nil {
@@ -452,6 +457,36 @@ func cmdDiscover(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
+func cmdTRPCManifest(cmd *cobra.Command, args []string) error {
+	cfg, err := runner.LoadConfig(f.config)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxWithSignals()
+	defer cancel()
+	b, err := rpcspec.ExtractRouter(ctx, strings.TrimPrefix(args[0], "trpc:"), cfg.API.TRPC.Command)
+	if err != nil {
+		return err
+	}
+	m, err := rpcspec.ParseManifest(b)
+	if err != nil {
+		return err
+	}
+	out := f.out
+	if out == "" {
+		out = "routeperf.trpc.json"
+	}
+	if err := os.WriteFile(out, b, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s: %d procedures", out, len(m.TRPC.Procedures))
+	if m.TRPC.Transformer != "" {
+		fmt.Printf(", %s transformer", m.TRPC.Transformer)
+	}
+	fmt.Println()
+	return nil
+}
+
 func cmdReport(cmd *cobra.Command, args []string) error {
 	b, err := os.ReadFile(args[0])
 	if err != nil {
@@ -625,7 +660,7 @@ func cmdInit(cmd *cobra.Command, _ []string) error {
 
 func askCore(p *prompter, cfg *runner.Config, all bool) {
 	if cfg.Spec == "" || all {
-		cfg.Spec = p.ask("Swagger / OpenAPI URL or file", cfg.Spec)
+		cfg.Spec = p.ask("API description: OpenAPI URL/file, GraphQL endpoint, grpc://host:port, tRPC router (root.ts), jsonrpc:http://host/rpc", cfg.Spec)
 	}
 	if cfg.API.BaseURL == "" || all {
 		def := cfg.API.BaseURL

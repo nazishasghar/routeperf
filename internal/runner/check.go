@@ -48,7 +48,7 @@ func (r *Runner) Doctor(ctx context.Context) []Check {
 	add := func(name, status, detail, fix string) {
 		out = append(out, Check{name, status, strings.Join(strings.Fields(detail), " "), fix})
 	}
-	if c.API.BaseURL == "" { // GraphQL / gRPC: the spec often is the server
+	if c.API.BaseURL == "" { // GraphQL / gRPC / JSON-RPC / Connect: the spec often is the server
 		switch r.protocol() {
 		case "grpc":
 			if t, _ := r.grpcTarget(); t != "" {
@@ -56,11 +56,17 @@ func (r *Runner) Doctor(ctx context.Context) []Check {
 			}
 		case "graphql":
 			c.API.BaseURL, _ = r.graphqlEndpoint()
+		case "jsonrpc":
+			c.API.BaseURL, _ = r.jsonrpcEndpoint()
+		case "connect":
+			if u, err := url.Parse(c.Spec); err == nil && u.Host != "" && (u.Scheme == "connect" || u.Scheme == "connects") {
+				c.API.BaseURL = map[string]string{"connect": "http://", "connects": "https://"}[u.Scheme] + u.Host
+			}
 		}
 	}
 	var missing []string
 	if c.Spec == "" {
-		missing = append(missing, "swagger/OpenAPI URL (--spec)")
+		missing = append(missing, "API description (--spec)")
 	}
 	if c.API.BaseURL == "" {
 		missing = append(missing, "API base URL (--api-url)")

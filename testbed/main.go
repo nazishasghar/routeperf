@@ -54,7 +54,7 @@ func main() {
 	ipo := flag.Int("items-per-order", 3, "items per order")
 	spu := flag.Int("sessions-per-user", 2, "sessions per user")
 	noise := flag.Duration("background-noise", 0, "run a background query at this interval (simulates a cron job), e.g. 100ms")
-	grpcAddr := flag.String("grpc-addr", "", "also serve the gRPC API (with server reflection) on this address, e.g. 127.0.0.1:50051")
+	grpcAddr := flag.String("grpc-addr", "", "also serve the gRPC API (with server reflection) on this address, e.g. 127.0.0.1:50051 (Connect, Twirp, tRPC and JSON-RPC are always served on --addr)")
 	flag.BoolVar(&sqlcomment, "sqlcommenter", false, "append /*traceparent='…'*/ from the request to every SQL statement (like OpenTelemetry sqlcommenter)")
 	flag.Parse()
 	if *dbURL == "" {
@@ -102,10 +102,12 @@ func main() {
 			}
 		}()
 	}
+	initShop()
 	if *grpcAddr != "" {
 		serveGRPC(*grpcAddr)
 	}
 	mux := http.NewServeMux()
+	registerRPC(mux, *addr)
 	mux.HandleFunc("POST /graphql", authed(graphqlHandler))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]any{"ok": true}) })
 	mux.HandleFunc("GET /swagger.json", func(w http.ResponseWriter, r *http.Request) {

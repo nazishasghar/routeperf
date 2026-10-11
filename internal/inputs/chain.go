@@ -289,10 +289,11 @@ func pointer(v any, p string) (any, bool) {
 var cursorNames = []string{"cursor", "after", "page_token", "pageToken", "next", "next_token", "nextToken", "starting_after",
 	"startingAfter", "continuation", "continuation_token", "continuationToken", "page_cursor", "pageCursor", "next_cursor", "nextCursor"}
 
-// CursorParam returns the query parameter that carries a pagination cursor.
+// CursorParam returns the query parameter (or GraphQL/RPC argument) that
+// carries a pagination cursor.
 func CursorParam(op *spec.Operation) string {
 	for _, p := range op.Params {
-		if p.In != "query" {
+		if p.In != "query" && p.In != "arg" {
 			continue
 		}
 		for _, c := range cursorNames {

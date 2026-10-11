@@ -96,15 +96,26 @@ func (t *grpcTransport) Send(ctx context.Context, req *inputs.Request) (int, []b
 	return 0, nil, nil, 0, fmt.Errorf("unreachable")
 }
 
-// grpcTarget returns host:port and whether to use TLS.
+// grpcTarget returns host:port and whether to use TLS: the gRPC server, or
+// for Connect/Twirp the server reflection is asked (the spec's address
+// before the HTTP API URL).
 func (r *Runner) grpcTarget() (string, bool) {
 	c := r.cfg
-	for _, s := range []string{c.API.GRPC.Target, c.API.BaseURL, c.Spec} {
+	srcs := []string{c.API.GRPC.Target, c.API.BaseURL, c.Spec}
+	if r.protocol() != "grpc" {
+		srcs = []string{c.API.GRPC.Target, c.Spec, c.API.BaseURL}
+	}
+	for _, s := range srcs {
 		if s == "" {
 			continue
 		}
-		if u, err := url.Parse(s); err == nil && (u.Scheme == "grpc" || u.Scheme == "grpcs" || u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
-			return u.Host, u.Scheme == "grpcs" || u.Scheme == "https" || c.API.GRPC.TLS
+		if u, err := url.Parse(s); err == nil && u.Host != "" {
+			switch u.Scheme {
+			case "grpc", "http", "connect":
+				return u.Host, c.API.GRPC.TLS
+			case "grpcs", "https", "connects":
+				return u.Host, true
+			}
 		}
 		if !strings.Contains(s, "://") && strings.Contains(s, ":") && !strings.HasSuffix(s, ".proto") {
 			return s, c.API.GRPC.TLS
@@ -115,48 +126,86 @@ func (r *Runner) grpcTarget() (string, bool) {
 
 func (r *Runner) loadGRPC(ctx context.Context, add addFn) bool {
 	c := r.cfg
-	target, useTLS := r.grpcTarget()
-	if target == "" {
-		add("Spec", "fail", "no gRPC server address", "use --spec grpc://host:port (server reflection) or --spec api.proto --api-url grpc://host:port")
-		return false
-	}
-	creds := insecure.NewCredentials()
-	if useTLS {
-		creds = credentials.NewTLS(&tls.Config{})
-	}
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(creds))
-	if err != nil {
-		add("Spec", "fail", err.Error(), "")
-		return false
-	}
-	var svcs []protoreflect.ServiceDescriptor
+	proto := r.protocol()
 	var protos []string
-	for _, s := range strings.Split(c.Spec, ",") {
+	for _, s := range strings.Split(strings.TrimPrefix(c.Spec, proto+":"), ",") {
 		if strings.HasSuffix(strings.TrimSpace(s), ".proto") {
 			protos = append(protos, strings.TrimSpace(s))
 		}
 	}
+	target, useTLS := r.grpcTarget()
+	if target == "" && (proto == "grpc" || len(protos) == 0) {
+		fix := "use --spec grpc://host:port (server reflection) or --spec api.proto --api-url grpc://host:port"
+		if proto != "grpc" {
+			fix = "pass the .proto files: --spec api.proto --protocol " + proto + " --api-url http://host:port"
+		}
+		add("Spec", "fail", "no "+proto+" service description", fix)
+		return false
+	}
+	var conn *grpc.ClientConn
+	if target != "" {
+		creds := insecure.NewCredentials()
+		if useTLS {
+			creds = credentials.NewTLS(&tls.Config{})
+		}
+		var err error
+		if conn, err = grpc.NewClient(target, grpc.WithTransportCredentials(creds)); err != nil {
+			add("Spec", "fail", err.Error(), "")
+			return false
+		}
+	}
 	lctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+	var svcs []protoreflect.ServiceDescriptor
+	var err error
 	if len(protos) > 0 {
 		svcs, err = grpcspec.FromProtoFiles(lctx, protos, c.API.GRPC.ImportPaths)
 	} else {
 		svcs, err = grpcspec.FromReflection(lctx, conn)
 	}
 	if err != nil {
-		conn.Close()
-		add("Spec", "fail", err.Error(), "enable server reflection, or pass the .proto files with --spec a.proto,b.proto and --api-url grpc://host:port")
+		if conn != nil {
+			conn.Close()
+		}
+		fix := "enable server reflection, or pass the .proto files with --spec a.proto,b.proto and --api-url grpc://host:port"
+		if proto != "grpc" {
+			fix = "pass the .proto files with --spec a.proto,b.proto (or serve gRPC reflection, e.g. connectrpc.com/grpcreflect, at api.grpc.target)"
+		}
+		add("Spec", "fail", err.Error(), fix)
 		return false
 	}
-	r.sp, _ = grpcspec.Operations(svcs, "gRPC "+target)
-	r.tr = &grpcTransport{r: r, conn: conn}
+	where := target
+	if proto != "grpc" {
+		where = c.API.BaseURL
+	}
+	names := map[string]string{"grpc": "gRPC", "connect": "Connect", "twirp": "Twirp"}
+	r.sp, _ = grpcspec.Operations(svcs, names[proto]+" "+where)
+	if proto == "grpc" {
+		r.tr = &grpcTransport{r: r, conn: conn}
+	} else {
+		if conn != nil {
+			conn.Close()
+		}
+		prefix := c.API.RPCPrefix
+		hdr := map[string]string{}
+		if proto == "twirp" && prefix == "" {
+			prefix = "/twirp"
+		}
+		if proto == "connect" {
+			hdr["Connect-Protocol-Version"] = "1"
+		}
+		for _, o := range r.sp.Ops {
+			o.Protocol = proto
+		}
+		r.tr = &protoHTTPTransport{r: r, prefix: prefix, header: hdr}
+	}
 	unary := 0
 	for _, o := range r.sp.Ops {
 		if o.Unsupported == "" {
 			unary++
 		}
 	}
-	add("Spec", "ok", fmt.Sprintf("gRPC %s — %d services, %d unary methods (streaming methods are skipped)", target, len(svcs), unary), "")
+	add("Spec", "ok", fmt.Sprintf("%s %s — %d services, %d unary methods (streaming methods are skipped)", names[proto], where, len(svcs), unary), "")
 	if len(r.sp.Ops) == 0 {
 		add("Spec operations", "fail", "no methods found", "")
 		return false

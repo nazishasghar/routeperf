@@ -18,13 +18,23 @@ type Config struct {
 	API  struct {
 		BaseURL  string `yaml:"base_url"`
 		Timeout  string `yaml:"timeout"`
-		Protocol string `yaml:"protocol,omitempty"` // openapi | graphql | grpc (auto-detected from spec)
+		Protocol string `yaml:"protocol,omitempty"` // openapi | graphql | grpc | trpc | jsonrpc | connect | twirp (auto-detected from spec)
 		GraphQL  string `yaml:"graphql_path,omitempty"`
 		GRPC     struct {
 			Target      string   `yaml:"target,omitempty"` // host:port
 			TLS         bool     `yaml:"tls,omitempty"`
 			ImportPaths []string `yaml:"import_paths,omitempty"`
 		} `yaml:"grpc,omitempty"`
+		TRPC struct {
+			Path        string `yaml:"path,omitempty"`        // endpoint (default /trpc; Next.js apps use /api/trpc)
+			Transformer string `yaml:"transformer,omitempty"` // none | superjson (detected from the router)
+			Command     string `yaml:"command,omitempty"`     // loads the router (default: npx --yes tsx, or node for .js)
+		} `yaml:"trpc,omitempty"`
+		JSONRPC struct {
+			Path     string `yaml:"path,omitempty"`      // endpoint path (default: from the spec URL or OpenRPC servers, else /)
+			ParamsBy string `yaml:"params_by,omitempty"` // by-name | by-position (default: each method's paramStructure; "either" → by-position)
+		} `yaml:"jsonrpc,omitempty"`
+		RPCPrefix string `yaml:"rpc_prefix,omitempty"` // Connect/Twirp route prefix (Twirp default /twirp)
 	} `yaml:"api"`
 	DB struct {
 		URL         string   `yaml:"url"`
@@ -206,6 +216,9 @@ func (c *Config) Defaults() {
 	if c.API.GraphQL == "" {
 		c.API.GraphQL = "/graphql"
 	}
+	if c.API.TRPC.Path == "" {
+		c.API.TRPC.Path = "/trpc"
+	}
 	if c.Writes.Snapshot == "" {
 		c.Writes.Snapshot = "tables"
 	}
@@ -255,13 +268,17 @@ func upper(s []string) []string {
 }
 
 const SampleConfig = `# routeperf configuration. Values support ${ENV_VAR} and ${ENV_VAR:-default}.
-spec: http://localhost:3000/swagger.json   # OpenAPI/Swagger URL or file; or a GraphQL endpoint / .graphql SDL; or grpc://host:port / .proto files
+spec: http://localhost:3000/swagger.json   # OpenAPI/Swagger URL or file; a GraphQL endpoint / .graphql SDL; grpc://host:port / .proto files;
+                                           # a tRPC router (src/server/api/root.ts); jsonrpc:http://host/rpc / openrpc.json; connect://host:port
 api:
   base_url: http://localhost:3000
   timeout: 30s
-  # protocol: openapi            # openapi | graphql | grpc (auto-detected from spec)
+  # protocol: openapi            # openapi | graphql | grpc | trpc | jsonrpc | connect | twirp (auto-detected from spec)
   # graphql_path: /graphql       # GraphQL: endpoint path when spec is an SDL file
-  # grpc: { target: localhost:50051, tls: false, import_paths: [./proto] }
+  # grpc: { target: localhost:50051, tls: false, import_paths: [./proto] }   # also Connect/Twirp .proto imports and reflection
+  # trpc: { path: /api/trpc, transformer: superjson }   # tRPC endpoint; transformer is detected from the router
+  # jsonrpc: { path: /rpc, params_by: by-name }        # JSON-RPC endpoint; params by-name | by-position
+  # rpc_prefix: /twirp           # Connect/Twirp route prefix (Twirp default /twirp)
 db:
   url: ${DATABASE_URL}          # postgres://user@localhost:5432/app  or  mysql://root@127.0.0.1:3306/app
   allow_remote: false           # never point at production

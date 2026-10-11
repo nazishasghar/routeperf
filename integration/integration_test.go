@@ -11,6 +11,7 @@ package integration
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -574,6 +575,216 @@ func TestGraphQLAndGRPC(t *testing.T) {
 			}
 			if o := r["RPC Shop/GetUser"]; o.Status != "OK" || strings.Contains(strings.ReplaceAll(o.BigO, "log n_users", ""), "n_") {
 				t.Errorf("gRPC GetUser: want OK and O(log n_users), got %s %s", o.Status, o.BigO)
+			}
+		})
+	}
+}
+
+// TestRPCProtocols measures the testbed's procedure-style APIs: tRPC (plain
+// and superjson), JSON-RPC 2.0 (rpc.discover and an OpenRPC file), Connect
+// (schema from gRPC reflection) and Twirp (schema from the .proto file).
+// Each planted problem must come out with the right Big O and fix.
+func TestRPCProtocols(t *testing.T) {
+	dir := t.TempDir()
+	rp, tb := build(t, dir)
+	for _, c := range []struct{ name, url string }{{"postgres", os.Getenv("RP_IT_PG")}, {"mysql", os.Getenv("RP_IT_MYSQL")}} {
+		t.Run(c.name, func(t *testing.T) {
+			if c.url == "" {
+				t.Skip("database URL not set")
+			}
+			seed := exec.Command(tb, "--db-url", c.url, "--seed", "--users", env("RP_IT_USERS", "10000"))
+			if b, err := seed.CombinedOutput(); err != nil {
+				t.Fatalf("seed: %v\n%s", err, b)
+			}
+			port, gport := freePort(t), freePort(t)
+			api := fmt.Sprintf("http://127.0.0.1:%d", port)
+			srv := exec.Command(tb, "--db-url", c.url, "--addr", fmt.Sprintf("127.0.0.1:%d", port), "--grpc-addr", fmt.Sprintf("127.0.0.1:%d", gport))
+			srv.Stdout, srv.Stderr = os.Stderr, os.Stderr
+			if err := srv.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = srv.Process.Kill(); _, _ = srv.Process.Wait() }()
+			for i := 0; ; i++ {
+				if resp, err := http.Get(api + "/health"); err == nil {
+					resp.Body.Close()
+					break
+				}
+				if i > 100 {
+					t.Fatal("testbed did not start")
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			resp, err := http.Get(api + "/shop.proto")
+			if err != nil {
+				t.Fatal(err)
+			}
+			proto := filepath.Join(dir, "shop.proto")
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err := os.WriteFile(proto, b, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			sj := filepath.Join(dir, "superjson.yaml")
+			if err := os.WriteFile(sj, []byte("api:\n  trpc: { path: /trpc-sj }\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			type rop struct {
+				Method   string         `json:"method"`
+				Path     string         `json:"path"`
+				Phase    string         `json:"phase"`
+				Status   string         `json:"status"`
+				BigO     string         `json:"big_o"`
+				NPlusOne []string       `json:"n_plus_one"`
+				Pages    int            `json:"cursor_pages"`
+				KParam   string         `json:"k_param"`
+				Statuses map[string]int `json:"statuses"`
+				Advice   []advice       `json:"advice"`
+				Skipped  string         `json:"skipped"`
+			}
+			runRP := func(name, protocol, cfg string, args ...string) (map[string]rop, map[string]rop) {
+				out := filepath.Join(dir, c.name+"-"+name)
+				if cfg == "" {
+					cfg = filepath.Join(dir, "none.yaml")
+				}
+				all := append([]string{"run", "--yes", "--non-interactive", "-c", cfg, "--db-url", c.url, "-n", "4", "-o", out, "--token", "testtoken"}, args...)
+				b, err := exec.Command(rp, all...).CombinedOutput()
+				t.Logf("routeperf %s output:\n%s", name, b)
+				if err != nil {
+					t.Fatalf("routeperf %s: %v", name, err)
+				}
+				raw, err := os.ReadFile(filepath.Join(out, "results.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var res struct {
+					Protocol string `json:"protocol"`
+					Verified bool   `json:"restore_verified"`
+					Ops      []rop  `json:"operations"`
+					Skipped  []rop  `json:"skipped"`
+				}
+				if err := json.Unmarshal(raw, &res); err != nil {
+					t.Fatal(err)
+				}
+				if res.Protocol != protocol {
+					t.Errorf("%s: protocol = %q, want %s", name, res.Protocol, protocol)
+				}
+				if !res.Verified {
+					t.Errorf("%s: restore not verified", name)
+				}
+				ops, skipped := map[string]rop{}, map[string]rop{}
+				for _, o := range res.Ops {
+					ops[o.Path] = o
+					for code, n := range o.Statuses {
+						if code >= "300" {
+							t.Errorf("%s %s: %d responses with status %s", name, o.Path, n, code)
+						}
+					}
+				}
+				for _, o := range res.Skipped {
+					skipped[o.Path] = o
+				}
+				return ops, skipped
+			}
+			logOnly := func(bigO string) bool { // O(log n_users), O(1): no polynomial term in n
+				return !strings.Contains(strings.ReplaceAll(bigO, "log n_", "log "), "n_")
+			}
+			indexFix := func(o rop, table, col string) bool {
+				for _, a := range o.Advice {
+					if strings.Contains(a.SQL, "CREATE INDEX") && strings.Contains(a.SQL, table) && strings.Contains(a.SQL, col) {
+						return true
+					}
+				}
+				return false
+			}
+			get := func(name string, m map[string]rop, path string) rop {
+				o, ok := m[path]
+				if !ok {
+					t.Errorf("%s: %s missing", name, path)
+				}
+				return o
+			}
+
+			// ---- tRPC, plain JSON and superjson
+			for _, v := range []struct{ name, spec, cfg string }{
+				{"trpc", api + "/routeperf.trpc.json", ""},
+				{"trpc-superjson", api + "/superjson.trpc.json", sj},
+			} {
+				ops, skipped := runRP(v.name, "trpc", v.cfg, "--spec", v.spec, "--api-url", api)
+				for _, p := range []string{"user.byId", "user.byEmail", "user.me"} {
+					if o := get(v.name, ops, p); o.Status != "OK" || !logOnly(o.BigO) {
+						t.Errorf("%s %s: want OK and O(log n_users), got %s %s", v.name, p, o.Status, o.BigO)
+					}
+				}
+				if o := get(v.name, ops, "user.list"); o.BigO != "O(k)" || o.KParam != "limit" {
+					t.Errorf("%s user.list: want O(k) over limit, got %s (k %q)", v.name, o.BigO, o.KParam)
+				}
+				if o := get(v.name, ops, "order.byUser"); len(o.NPlusOne) == 0 || !strings.Contains(o.BigO, "n_orders") || !indexFix(o, "orders", "user_id") {
+					t.Errorf("%s order.byUser: want N+1, O(…n_orders) and an orders(user_id) index, got %s %v %+v", v.name, o.BigO, o.NPlusOne, o.Advice)
+				}
+				if o := get(v.name, ops, "order.search"); o.Pages < 2 || !logOnly(o.BigO) {
+					t.Errorf("%s order.search: want ≥2 cursor pages and work bounded by LIMIT (no n_orders), got %d pages, %s", v.name, o.Pages, o.BigO)
+				}
+				if o := get(v.name, ops, "order.create"); o.Phase != "W" || o.KParam != "items" || len(o.NPlusOne) == 0 {
+					t.Errorf("%s order.create: want a write with k = items and one INSERT per item, got %+v", v.name, o)
+				}
+				if o := get(v.name, ops, "user.create"); o.Phase != "W" {
+					t.Errorf("%s user.create: want a write, got %+v", v.name, o)
+				}
+				if o := get(v.name, skipped, "admin.purgeSessions"); !strings.Contains(o.Skipped, "dangerous") {
+					t.Errorf("%s admin.purgeSessions: want skipped as dangerous, got %q", v.name, o.Skipped)
+				}
+				if o := get(v.name, skipped, "order.onCreate"); !strings.Contains(o.Skipped, "subscription") {
+					t.Errorf("%s order.onCreate: want skipped as a subscription, got %q", v.name, o.Skipped)
+				}
+			}
+
+			// ---- JSON-RPC: service discovery, and an OpenRPC file
+			for _, v := range []struct {
+				name string
+				args []string
+			}{
+				{"jsonrpc", []string{"--spec", "jsonrpc:" + api + "/rpc"}},
+				{"openrpc", []string{"--spec", api + "/openrpc.json", "--protocol", "jsonrpc", "--api-url", api}},
+			} {
+				ops, _ := runRP(v.name, "jsonrpc", "", v.args...)
+				if o := get(v.name, ops, "user_get"); o.Status != "OK" || o.Phase != "R" || !logOnly(o.BigO) {
+					t.Errorf("%s user_get: want an OK read, O(log n_users), got %s %s %s", v.name, o.Phase, o.Status, o.BigO)
+				}
+				if o := get(v.name, ops, "orders_listByUser"); len(o.NPlusOne) == 0 || !strings.Contains(o.BigO, "n_orders") || !indexFix(o, "orders", "user_id") {
+					t.Errorf("%s orders_listByUser (by position): want N+1, n_orders and an index, got %s %v", v.name, o.BigO, o.NPlusOne)
+				}
+				if o := get(v.name, ops, "users_recent"); o.Phase != "R" || o.BigO != "O(k)" {
+					t.Errorf("%s users_recent (x-readonly): want a read, O(k), got %s %s", v.name, o.Phase, o.BigO)
+				}
+				if o := get(v.name, ops, "user_create"); o.Phase != "W" {
+					t.Errorf("%s user_create: want a write, got %s", v.name, o.Phase)
+				}
+			}
+
+			// ---- protobuf over HTTP: Connect (reflection), Twirp (.proto file)
+			for _, v := range []struct {
+				name string
+				args []string
+			}{
+				{"connect", []string{"--protocol", "connect", "--spec", fmt.Sprintf("grpc://127.0.0.1:%d", gport), "--api-url", api}},
+				{"twirp", []string{"--protocol", "twirp", "--spec", proto, "--api-url", api}},
+			} {
+				ops, _ := runRP(v.name, v.name, "", v.args...)
+				if o := get(v.name, ops, "Shop/GetUser"); o.Status != "OK" || !logOnly(o.BigO) {
+					t.Errorf("%s GetUser: want OK and O(log n_users), got %s %s", v.name, o.Status, o.BigO)
+				}
+				if o := get(v.name, ops, "Shop/ListUserOrders"); !strings.Contains(o.BigO, "n_orders") || !indexFix(o, "orders", "user_id") {
+					t.Errorf("%s ListUserOrders: want O(n_orders) and an orders(user_id) index, got %s %+v", v.name, o.BigO, o.Advice)
+				}
+				if o := get(v.name, ops, "Shop/SearchOrders"); !strings.Contains(o.BigO, "n_orders") || len(o.Advice) == 0 {
+					t.Errorf("%s SearchOrders: want O(n_orders) and an index, got %s", v.name, o.BigO)
+				}
+				if o := get(v.name, ops, "Shop/RecentUsers"); o.Phase != "R" || o.BigO != "O(k)" || o.KParam != "pageSize" { // protojson name
+					t.Errorf("%s RecentUsers (NO_SIDE_EFFECTS): want a read, O(k) over page_size, got %s %s %q", v.name, o.Phase, o.BigO, o.KParam)
+				}
+				if o := get(v.name, ops, "Shop/CreateUser"); o.Phase != "W" {
+					t.Errorf("%s CreateUser: want a write, got %s", v.name, o.Phase)
+				}
 			}
 		})
 	}

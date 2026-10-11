@@ -321,6 +321,25 @@ func Percentile(v []float64, p float64) float64 {
 
 func round4(v float64) float64 { return math.Round(v*1e4) / 1e4 }
 
+// boundedWork reports rows-examined counts that jitter instead of growing.
+// Subsets are nested, so a scan that grows with the data never examines
+// fewer rows on a larger subset; an index walk stopped by LIMIT examines
+// however many rows it meets before enough match, which goes up and down.
+// It needs a drop of over 20% between steps and a log-log slope that is not
+// clearly above zero.
+func boundedWork(work []Point) (s, hw float64, ok bool) {
+	pts := medianByX(work)
+	drops := false
+	for i := 1; i < len(pts); i++ {
+		drops = drops || pts[i].Y < 0.8*pts[i-1].Y
+	}
+	if !drops {
+		return 0, 0, false
+	}
+	s, hw, ok = SlopeCI(work)
+	return s, hw, ok && s-hw <= 0.2
+}
+
 // DominantDegree fits y = a + b·x + c·x² (non-negative) and returns the
 // degree of the term that dominates at the largest x (0, 1 or 2). This
 // catches mixtures like serialization O(k) + nested loop O(k²).

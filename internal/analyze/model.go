@@ -221,6 +221,10 @@ func AnalyzeQuery(q *QueryResult, tableRows map[string]float64) {
 		}
 		if hi-lo < 5 { // a handful of rows at every size: constant work
 			wf = Fit{Class: O1, ClassName: O1.String(), OK: true, R2: 1, Points: wf.Points, Decades: wf.Decades, SlopeAgree: true, All: wf.All, Slope: 0, SlopeCI: 0}
+		} else if s, hw, ok := boundedWork(work); ok && wf.Class.Degree() > 0 {
+			wf = Fit{Class: O1, ClassName: O1.String(), OK: true, R2: wf.R2, Points: wf.Points, Decades: wf.Decades, SlopeAgree: true, All: wf.All, Slope: s, SlopeCI: hw}
+			q.Notes = append(q.Notes, fmt.Sprintf("rows examined go up and down across nested data subsets (log-log slope %s) instead of growing: "+
+				"bounded work, like an index walk that stops at LIMIT", FmtSlope(s, hw)))
 		}
 		if tf.SlopeCI > 9 {
 			tf.SlopeCI = 9.99

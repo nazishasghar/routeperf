@@ -25,6 +25,21 @@ type Fixture struct {
 	Query  map[string]any `yaml:"query"`
 	Header map[string]any `yaml:"header"`
 	Body   any            `yaml:"body"`
+	// Input is a GraphQL operation's or RPC procedure's input: its arguments
+	// by name, or the whole value when a tRPC procedure takes a scalar.
+	Input any `yaml:"input"`
+}
+
+// args returns the fixture values for GraphQL/RPC arguments, by name.
+func (fx Fixture) args(op *spec.Operation) map[string]any {
+	if op.RPC != nil && op.RPC.Wrap == "value" && fx.Input != nil {
+		return map[string]any{"input": fx.Input}
+	}
+	if m, ok := fx.Input.(map[string]any); ok {
+		return m
+	}
+	m, _ := fx.Body.(map[string]any)
+	return m
 }
 
 type Request struct {
@@ -44,14 +59,15 @@ type Request struct {
 type KInfo struct {
 	Name     string // query param / GraphQL argument name, or body property
 	InBody   bool
-	Scalar   bool // body integer (gRPC page_size) rather than an array
+	Scalar   bool // body integer (protobuf page_size) rather than an array
+	Array    bool // GraphQL/RPC argument that is a list of objects (k items)
 	Min, Max int
 }
 
 // pathFor is the path used to map ID inputs to tables: GraphQL fields and
-// gRPC methods have no URL, so their resource stands in (user → /user/{id}).
+// RPC procedures have no URL, so their resource stands in (user → /user/{id}).
 func pathFor(op *spec.Operation) string {
-	if op.Protocol == "graphql" || op.Protocol == "grpc" {
+	if op.Protocol != "" && op.Protocol != "http" {
 		return "/" + op.Resource + "/{id}"
 	}
 	return op.Path
@@ -251,7 +267,7 @@ func (r *Resolver) KParam(op *spec.Operation) *KInfo {
 	}
 	if op.Body != nil && op.Body.Schema != nil && op.Method != "GET" {
 		names := sortedProps(op.Body.Schema)
-		if op.Protocol == "grpc" {
+		if op.GRPC != nil {
 			for _, n := range names {
 				ps := op.Body.Schema.Properties[n].Value
 				if ps != nil && ps.Type.Is("integer") && isKName(n, r.KParams) {
@@ -261,19 +277,37 @@ func (r *Resolver) KParam(op *spec.Operation) *KInfo {
 		}
 		for _, n := range names {
 			ps := op.Body.Schema.Properties[n].Value
-			if ps != nil && ps.Type.Is("array") && ps.Items != nil && ps.Items.Value != nil && ps.Items.Value.Type.Is("object") {
-				k := &KInfo{Name: n, InBody: true, Min: int(ps.MinItems), Max: 1000}
-				if k.Min < 1 {
-					k.Min = 1
-				}
-				if ps.MaxItems != nil {
-					k.Max = int(*ps.MaxItems)
-				}
+			if k := listK(n, ps); k != nil {
+				k.InBody = true
 				return k
 			}
 		}
 	}
+	for _, p := range op.Params {
+		if p.In != "arg" {
+			continue
+		}
+		if k := listK(p.Name, p.Schema); k != nil {
+			k.Array = true
+			return k
+		}
+	}
 	return nil
+}
+
+// listK makes a list of objects (bulk create items) the size knob.
+func listK(name string, ps *openapi3.Schema) *KInfo {
+	if ps == nil || !ps.Type.Is("array") || ps.Items == nil || ps.Items.Value == nil || !ps.Items.Value.Type.Is("object") {
+		return nil
+	}
+	k := &KInfo{Name: name, Min: int(ps.MinItems), Max: 1000}
+	if k.Min < 1 {
+		k.Min = 1
+	}
+	if ps.MaxItems != nil {
+		k.Max = int(*ps.MaxItems)
+	}
+	return k
 }
 
 func sortedProps(s *openapi3.Schema) []string {
@@ -311,7 +345,7 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 		if ov, ok := overrides[p.Name]; ok && p.In == "path" {
 			val, have = ov, true
 		}
-		if !have && cur != "" && p.In == "query" && p.Name == CursorParam(op) {
+		if !have && cur != "" && (p.In == "query" || p.In == "arg") && p.Name == CursorParam(op) {
 			val, have = cur, true
 		}
 		if !have && (op.Phase == "W" || p.In != "path") {
@@ -328,6 +362,8 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 				src = fx.Query
 			case "header":
 				src = fx.Header
+			case "arg":
+				src = fx.args(op)
 			}
 			if v, ok := src[p.Name]; ok {
 				if fv, err := r.fixtureValue(ctx, v, iter); err == nil {
@@ -339,6 +375,14 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 		}
 		if ki != nil && !ki.InBody && p.Name == ki.Name && k >= 0 {
 			val, have = k, true
+			if ki.Array {
+				item := r.gen(ctx, p.Schema.Items.Value, p.Name, opPath, iter, 1)
+				arr := make([]any, k)
+				for i := range arr {
+					arr[i] = uniquify(deepCopy(item), r.RunID, iter*10000+i, "")
+				}
+				val = arr
+			}
 		}
 		if !have && (p.In == "path" || idName.MatchString(p.Name) || p.In == "arg" && strings.EqualFold(p.Name, "id")) {
 			if t := r.tableFor(p.Name, opPath); t != nil {
@@ -390,9 +434,13 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 		case op.Body.Example != nil:
 			body = r.refreshIDs(ctx, uniquify(deepCopy(op.Body.Example), r.RunID, iter, ""), op.Path, iter)
 		case op.Body.Schema != nil:
-			body = r.gen(ctx, op.Body.Schema, "", op.Path, iter, 0)
+			body = r.gen(ctx, op.Body.Schema, "", opPath, iter, 0)
 		}
-		if ki != nil && ki.InBody && k >= 0 {
+		if ki != nil && ki.InBody && ki.Scalar && k >= 0 {
+			if m, ok := body.(map[string]any); ok {
+				m[ki.Name] = k
+			}
+		} else if ki != nil && ki.InBody && k >= 0 {
 			if m, ok := body.(map[string]any); ok {
 				var first any
 				if arr, ok := m[ki.Name].([]any); ok && len(arr) > 0 {
