@@ -152,7 +152,7 @@ routeperf run      # measures every endpoint; prints the table and writes the re
 `init` asks for:
 
 ```
-Swagger / OpenAPI URL or file: http://localhost:3000/swagger.json
+API description: OpenAPI URL/file, GraphQL endpoint, grpc://host:port, tRPC router (root.ts), jsonrpc:http://host/rpc: http://localhost:3000/swagger.json
 API base URL [http://localhost:3000]:
 Database URL (postgres://user:pass@localhost:5432/db or mysql://user:pass@127.0.0.1:3306/db): postgres://me@localhost:5432/app_dev
 How does the API authenticate? (comma-separated numbers)
@@ -188,6 +188,51 @@ You don't need a config file. Every setting can be passed as a flag:
 routeperf run --spec http://localhost:3000/swagger.json --api-url http://localhost:3000 \
   --db-url postgres://me@localhost:5432/app_dev --token "$API_TOKEN"
 ```
+
+### One command per protocol
+
+The protocol is detected from `--spec`; `--protocol` sets it when a `.proto` file could be gRPC, Connect or Twirp. Each `run` checks connections first; swap `run` for `discover` to only list the operations it would call.
+
+```bash
+export DB=postgres://me@localhost:5432/app_dev     # or mysql://root@127.0.0.1:3306/app_dev
+
+# OpenAPI / Swagger: the spec URL or file
+routeperf run --spec http://localhost:3000/openapi.json --api-url http://localhost:3000 --db-url "$DB" --token "$API_TOKEN"
+
+# GraphQL: the endpoint (schema from introspection), or a .graphql SDL file plus --api-url
+routeperf run --spec http://localhost:4000/graphql --db-url "$DB" --token "$API_TOKEN"
+
+# gRPC: server reflection, or .proto files plus --api-url grpc://localhost:50051
+routeperf run --spec grpc://localhost:50051 --db-url "$DB" --token "$API_TOKEN"
+
+# tRPC: the file that exports the app router (loaded with Node via npx tsx)
+routeperf run --spec src/server/router.ts --api-url http://localhost:2022 --db-url "$DB" --token "$API_TOKEN"
+
+# JSON-RPC 2.0: the endpoint (OpenRPC rpc.discover), or an openrpc.json plus --api-url
+routeperf run --spec jsonrpc:http://localhost:8545/rpc --db-url "$DB" --token "$API_TOKEN"
+
+# Connect: .proto files (or connect://localhost:8080 when it serves gRPC reflection)
+routeperf run --protocol connect --spec proto/shop/v1/shop.proto --api-url http://localhost:8080 --db-url "$DB" --token "$API_TOKEN"
+
+# Twirp: .proto files; routes under /twirp
+routeperf run --protocol twirp --spec proto/shop.proto --api-url http://localhost:8080 --db-url "$DB" --token "$API_TOKEN"
+```
+
+A tRPC app on Next.js (create-t3-app and similar) serves the router under `/api/trpc` and usually authenticates with a session cookie. Set the path in `routeperf.yaml` and pass the cookie:
+
+```yaml
+# routeperf.yaml
+spec: src/server/api/root.ts
+api: { base_url: http://localhost:3000, trpc: { path: /api/trpc } }
+db: { url: "${DATABASE_URL}" }
+auth: { cookies: { next-auth.session-token: "${SESSION}" } }   # Auth.js v5: authjs.session-token
+```
+
+```bash
+routeperf run
+```
+
+Without Node (in CI, say), write the router's procedure list once with `routeperf trpc-manifest src/server/api/root.ts` and use `--spec routeperf.trpc.json`. Protocol details and options: [GraphQL and gRPC](#graphql-and-grpc), [tRPC, JSON-RPC, Connect and Twirp](#trpc-json-rpc-connect-and-twirp).
 
 ---
 
