@@ -523,8 +523,8 @@ routeperf run --protocol twirp --spec api/shop.proto --api-url http://localhost:
 | Command | What it does |
 |---|---|
 | `routeperf init` | Interactive setup; writes `routeperf.yaml` (secrets as env-var references unless you choose otherwise) |
-| `routeperf check` | Verifies spec, API, auth, DB, privileges, SQL capture and the API→DB link, and says what to fix. Exit code 1 if anything fails |
-| `routeperf discover` | Lists the operations that will run and the ones skipped (with the reason) |
+| `routeperf check` | Verifies spec, API, auth, DB, privileges, SQL capture and the API→DB link, and says what to fix. Exit code 1 if anything fails. Accepts `--only` / `--exclude` to check just some endpoints (see below) |
+| `routeperf discover` | Lists the operations that will run and the ones skipped (with the reason). Accepts `--only` / `--exclude` |
 | `routeperf run` | Full run: check → requests → capture → EXPLAIN replay at every scale → restore → report |
 | `routeperf load` | Concurrent load test per endpoint, without the data-scale experiments ([Load mode](#load-mode)) |
 | `routeperf proxy` | Runs the SQL capture proxy ([Proxy capture](#no-admin-rights-proxy-capture)) |
@@ -534,6 +534,16 @@ routeperf run --protocol twirp --spec api/shop.proto --api-url http://localhost:
 | `routeperf trpc-manifest <router.ts>` | Writes a tRPC router's procedures and input schemas to `routeperf.trpc.json`, for runs where Node can't load the router |
 | `routeperf version` | Version info |
 | `routeperf completion zsh\|bash\|fish\|powershell` | Shell completion |
+
+Run on only some endpoints: `run`, `load`, `check` and `discover` all take `--only` and `--exclude`.
+
+```bash
+routeperf check --only "GET /orders/**" --only tag:user     # probe and count just these
+routeperf discover --exclude "/admin/**"                     # preview what would run
+routeperf run --only listUsers,getOrder                      # measure just these two
+```
+
+`check` shows `N of M operations will run` and warns when a pattern matches nothing (usually a typo).
 
 Useful `run` flags:
 
