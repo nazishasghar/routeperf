@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -355,7 +356,7 @@ func (r *Runner) Doctor(ctx context.Context) []Check {
 // operation, which is almost always a typo.
 func (r *Runner) unmatchedPatterns() []string {
 	var dead []string
-	for _, p := range append(append([]string(nil), r.cfg.Run.Include...), r.cfg.Run.Exclude...) {
+	for _, p := range slices.Concat(r.cfg.Run.Include, r.cfg.Run.Exclude) {
 		hit := false
 		for _, o := range r.sp.Ops {
 			if spec.Match(p, o) {

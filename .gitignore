@@ -5,3 +5,4 @@ routeperf-out/
 # local config usually holds URLs/secrets; share routeperf.example.yaml instead
 routeperf.yaml
 fixtures.local.yaml
+.DS_Store
