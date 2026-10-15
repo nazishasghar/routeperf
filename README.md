@@ -541,7 +541,7 @@ Useful `run` flags:
 |---|---|
 | `--no-writes` | GET/HEAD only (GraphQL and tRPC queries, RPC reads) |
 | `-y`, `--yes` | don't ask before running write operations (required in non-interactive shells) |
-| `--only <ids>`, `--exclude <ids>` | operationIds, `tag:<name>`, `"METHOD /path"` or path globs (`/admin/**`) |
+| `--only <ids>`, `--exclude <ids>` | operationIds, `tag:<name>`, `"METHOD /path"` or path globs (`/admin/**`). Also accepted by `check` and `discover`; `check` warns when a pattern matches nothing |
 | `--no-scale` | skip the scaling experiments; plan-only Big O, faster but lower confidence |
 | `--no-per-table` | skip shrinking one table at a time |
 | `--cold`, `--cold-cmd "<cmd>"` | also measure cold-cache first hits ([Cold cache](#cold-cache)) |

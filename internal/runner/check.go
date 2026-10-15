@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -332,7 +333,14 @@ func (r *Runner) Doctor(ctx context.Context) []Check {
 	if len(rs) > 0 {
 		detail += "; skipped: " + strings.Join(rs, ", ")
 	}
-	add("Operations", st, detail, "")
+	fix := ""
+	if dead := r.unmatchedPatterns(); len(dead) > 0 {
+		if st == "ok" {
+			st = "warn"
+		}
+		fix = "no operation matches: " + strings.Join(dead, ", ") + " (use operationIds, tag:<name>, \"METHOD /path\" or globs like /admin/**)"
+	}
+	add("Operations", st, detail, fix)
 	if c.WritesEnabled() {
 		add("Writes", "ok", fmt.Sprintf("enabled; snapshot strategy %q (data restored after the run)", c.Writes.Snapshot), "")
 	}
@@ -341,6 +349,25 @@ func (r *Runner) Doctor(ctx context.Context) []Check {
 		r.result.secrets = append(r.result.secrets, r.roleAM[n].Secrets()...)
 	}
 	return out
+}
+
+// unmatchedPatterns lists run.include / run.exclude entries that select no
+// operation, which is almost always a typo.
+func (r *Runner) unmatchedPatterns() []string {
+	var dead []string
+	for _, p := range append(append([]string(nil), r.cfg.Run.Include...), r.cfg.Run.Exclude...) {
+		hit := false
+		for _, o := range r.sp.Ops {
+			if spec.Match(p, o) {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			dead = append(dead, strconv.Quote(p))
+		}
+	}
+	return dead
 }
 
 // rolesCheck validates auth.roles and run.as and says how many operations
