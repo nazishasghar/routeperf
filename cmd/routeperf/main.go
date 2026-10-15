@@ -100,8 +100,6 @@ Start with:  routeperf init   →   routeperf check   →   routeperf run`,
 	runCmd.Flags().BoolVarP(&f.yes, "yes", "y", false, "don't ask before running write operations")
 	runCmd.Flags().BoolVar(&f.noWrites, "no-writes", false, "only GET/HEAD operations")
 	runCmd.Flags().BoolVar(&f.noScale, "no-scale", false, "skip data/output scale experiments (static Big O only)")
-	runCmd.Flags().StringSliceVar(&f.only, "only", nil, "operationIds or tag:<name> to include")
-	runCmd.Flags().StringSliceVar(&f.exclude, "exclude", nil, "operationIds or tag:<name> to exclude")
 	runCmd.Flags().StringVarP(&f.out, "out", "o", "", "output directory (default routeperf-out)")
 	runCmd.Flags().IntVarP(&f.iterations, "iterations", "n", 0, "timed requests per operation")
 	runCmd.Flags().BoolVar(&f.ci, "ci", false, "exit 2 when any route FAILs")
@@ -126,7 +124,6 @@ the SQL the app sends. It needs no admin rights and no access to server logs, so
 Cloud SQL and shared dev servers. Start it, restart the app with the printed database URL, then run
 routeperf with --capture proxy in another terminal.`, RunE: cmdProxy}
 	loadCmd := &cobra.Command{Use: "load", Short: "Concurrent load test per endpoint: throughput, latency, DB connections and lock waits", RunE: cmdLoad}
-	loadCmd.Flags().AddFlagSet(runCmd.Flags())
 	diffCmd := &cobra.Command{Use: "diff <base.json> <new.json>", Short: "Compare two runs; exit 2 when an endpoint got worse (Big O, p95, queries, N+1, status)",
 		Example: "  routeperf diff main/results.json pr/results.json\n  routeperf diff base.json new.json --p95-pct 10 -o diff.md", Args: cobra.ExactArgs(2), RunE: cmdDiff}
 	diffCmd.Flags().Float64Var(&f.diffP95, "p95-pct", 20, "fail when p95 grows by at least this percent")
@@ -140,6 +137,11 @@ routeperf with --capture proxy in another terminal.`, RunE: cmdProxy}
 	versionCmd := &cobra.Command{Use: "version", Short: "Print the routeperf version", Run: func(*cobra.Command, []string) {
 		fmt.Println("routeperf", version.String())
 	}}
+	for _, c := range []*cobra.Command{runCmd, checkCmd, discoverCmd} { // loadCmd copies runCmd's flags
+		c.Flags().StringSliceVar(&f.only, "only", nil, `endpoints to include: operationIds, tag:<name>, "METHOD /path" or path globs (/admin/**)`)
+		c.Flags().StringSliceVar(&f.exclude, "exclude", nil, "endpoints to exclude (same patterns as --only)")
+	}
+	loadCmd.Flags().AddFlagSet(runCmd.Flags())
 	root.AddCommand(runCmd, proxyCmd, loadCmd, checkCmd, discoverCmd, initCmd, repairCmd, reportCmd, diffCmd, trpcCmd, versionCmd)
 
 	report.Color = isTTY(os.Stdout)
