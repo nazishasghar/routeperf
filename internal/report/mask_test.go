@@ -16,3 +16,18 @@ func TestMaskSQL(t *testing.T) {
 		}
 	}
 }
+
+func TestMaskSQLMySQLDoubleQuotesAndHex(t *testing.T) {
+	tests := []struct{ name, dialect, in, want string }{
+		{"mysql double-quoted string", "mysql", `SELECT * FROM u WHERE email = "bob@x.com" AND id = 7`, `SELECT * FROM u WHERE email = ? AND id = ?`},
+		{"mysql hex literal", "mysql", `SELECT * FROM u WHERE tok = 0x414243`, `SELECT * FROM u WHERE tok = ?`},
+		{"postgres keeps quoted identifiers", "postgres", `SELECT "Name" FROM "Users" WHERE id = 7`, `SELECT "Name" FROM "Users" WHERE id = ?`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := maskSQL(tt.in, tt.dialect); got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

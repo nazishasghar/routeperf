@@ -98,8 +98,8 @@ func flatten(v url.Values, prefix string, x any) {
 }
 
 func scalar(v any) string {
-	if f, ok := v.(float64); ok && f == float64(int64(f)) {
-		return strconv.FormatInt(int64(f), 10)
+	if f, ok := v.(float64); ok {
+		return strconv.FormatFloat(f, 'f', -1, 64) // fmt.Sprint would print 1e+06
 	}
 	return fmt.Sprint(v)
 }
@@ -222,7 +222,7 @@ func evalExpr(expr any, req *Request, status int, body any, hdr http.Header) (an
 		out := exprRe.ReplaceAllStringFunc(s, func(m string) string {
 			v, good := evalExpr(m[1:len(m)-1], req, status, body, hdr)
 			ok = ok && good
-			return fmt.Sprint(v)
+			return scalar(v)
 		})
 		return out, ok
 	}

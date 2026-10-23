@@ -38,13 +38,21 @@ const (
 
 func fmtNum(v float64) string {
 	a := math.Abs(v)
+	round1 := func(x float64) float64 { return math.Round(x*10) / 10 }
+	units := []struct {
+		div float64
+		suf string
+	}{{1e9, "B"}, {1e6, "M"}, {1e3, "k"}}
+	for i, u := range units {
+		if a < u.div {
+			continue
+		}
+		if i > 0 && math.Abs(round1(v/u.div)) >= 1000 { // 999.96k rounds up to 1000k: step up
+			u = units[i-1]
+		}
+		return trimZero(fmt.Sprintf("%.1f", v/u.div)) + u.suf
+	}
 	switch {
-	case a >= 1e9:
-		return trimZero(fmt.Sprintf("%.1f", v/1e9)) + "B"
-	case a >= 1e6:
-		return trimZero(fmt.Sprintf("%.1f", v/1e6)) + "M"
-	case a >= 1e3:
-		return trimZero(fmt.Sprintf("%.1f", v/1e3)) + "k"
 	case a >= 10 || v == math.Trunc(v):
 		return fmt.Sprintf("%.0f", v)
 	case a >= 1:
