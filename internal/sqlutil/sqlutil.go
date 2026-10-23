@@ -11,8 +11,11 @@ import (
 )
 
 var (
-	reComment  = regexp.MustCompile(`(?s)/\*.*?\*/|--[^\n]*`)
-	reString   = regexp.MustCompile(`'(?:[^']|'')*'`)
+	reComment = regexp.MustCompile(`(?s)/\*.*?\*/|--[^\n]*`)
+	// reLexeme matches a string literal or comment in one pass, so a comment
+	// marker inside a literal (and a quote inside a comment) is not misread.
+	reLexeme   = regexp.MustCompile(`(?s)'(?:[^']|'')*'|/\*.*?\*/|--[^\n]*`)
+	reParamLex = regexp.MustCompile(`(?s)'(?:[^']|'')*'|"(?:[^"]|"")*"|/\*.*?\*/|--[^\n]*|\$(\d+)`)
 	reNumber   = regexp.MustCompile(`\b\d+(?:\.\d+)?\b`)
 	reParam    = regexp.MustCompile(`\$\d+|\?`)
 	reInList   = regexp.MustCompile(`(?i)\(\s*\?(?:\s*,\s*\?)+\s*\)`)
@@ -20,7 +23,6 @@ var (
 	reSpace    = regexp.MustCompile(`\s+`)
 	reTables   = regexp.MustCompile("(?i)\\b(?:from|join|update|into)\\s+(?:only\\s+)?[`\"]?(\\w+)[`\"]?(?:\\.[`\"]?(\\w+)[`\"]?)?")
 	reDeleteT  = regexp.MustCompile("(?i)^\\s*delete\\s+from\\s+[`\"]?(\\w+)[`\"]?(?:\\.[`\"]?(\\w+)[`\"]?)?")
-	rePgParam  = regexp.MustCompile(`\$(\d+)`)
 	reLimitNum = regexp.MustCompile(`(?i)\blimit\s+(\d+)`)
 	reTrace    = regexp.MustCompile(`traceparent(?:=|%3[dD])(?:'|%27)?00-([0-9a-f]{32})-`)
 )
@@ -39,8 +41,12 @@ func TraceID(sql string) string {
 
 // Normalize strips comments/literals so equivalent statements compare equal.
 func Normalize(sql string) string {
-	s := reComment.ReplaceAllString(sql, " ")
-	s = reString.ReplaceAllString(s, "?")
+	s := reLexeme.ReplaceAllStringFunc(sql, func(m string) string {
+		if m[0] == '\'' {
+			return "?"
+		}
+		return " "
+	})
 	s = reParam.ReplaceAllString(s, "?") // before numbers, or $1 becomes $?
 	s = reNumber.ReplaceAllString(s, "?")
 	s = reInList.ReplaceAllString(s, "(?)")
@@ -120,7 +126,10 @@ func TargetTable(sql string) string {
 // InlinePG replaces $n with quoted literals (untyped, so the server infers
 // types as it did for the original Parse). "NULL" stays NULL.
 func InlinePG(sql string, params []string, nulls map[int]bool) string {
-	return rePgParam.ReplaceAllStringFunc(sql, func(m string) string {
+	return reParamLex.ReplaceAllStringFunc(sql, func(m string) string {
+		if m[0] != '$' {
+			return m // literal, quoted identifier or comment
+		}
 		i, _ := strconv.Atoi(m[1:])
 		if i < 1 || i > len(params) {
 			return m
@@ -135,9 +144,19 @@ func InlinePG(sql string, params []string, nulls map[int]bool) string {
 // RewriteSchema replaces qualified references schema.table → target.table
 // for the given tables (handles quoting styles of PG and MySQL).
 func RewriteSchema(sql, schema, target string, tables []string) string {
+	as := make(map[string]string, len(tables))
 	for _, t := range tables {
+		as[t] = t
+	}
+	return RewriteSchemaAs(sql, schema, target, as)
+}
+
+// RewriteSchemaAs is RewriteSchema for copies that carry another name:
+// tables maps each written name to its name inside target.
+func RewriteSchemaAs(sql, schema, target string, tables map[string]string) string {
+	for t, to := range tables {
 		re := regexp.MustCompile("(?i)[`\"]?\\b" + regexp.QuoteMeta(schema) + "\\b[`\"]?\\s*\\.\\s*[`\"]?\\b" + regexp.QuoteMeta(t) + "\\b[`\"]?")
-		sql = re.ReplaceAllString(sql, target+"."+t)
+		sql = re.ReplaceAllLiteralString(sql, target+"."+to)
 	}
 	return sql
 }

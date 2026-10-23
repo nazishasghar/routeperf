@@ -119,6 +119,11 @@ func parsePG(sql string) (Parsed, error) {
 	} else {
 		p.Fingerprint = Fingerprint(sql)
 	}
+	if len(tree.Stmts) > 1 {
+		// "SELECT 1; COMMIT; DELETE …" must never reach EXPLAIN as one string
+		p.Kind = "other"
+		return p, nil
+	}
 	refs, dml := pgRefs(tree.Stmts[0].Stmt, sql)
 	p.Refs = refs
 	switch n := tree.Stmts[0].Stmt.Node.(type) {
@@ -156,18 +161,53 @@ func pgRef(rv *pgq.RangeVar, sql string) Ref {
 }
 
 // pgRefs walks the parse tree for RangeVars, skipping unqualified references
-// to CTE names, and reports the kind of a data-modifying CTE if any.
+// to CTE names that are in scope, and reports the kind of a data-modifying
+// CTE if any. A CTE name only hides a table inside the statement that
+// declares it: `FROM orders WHERE id IN (WITH orders AS (…) SELECT … FROM orders)`
+// still reads the outer table.
 func pgRefs(root *pgq.Node, sql string) ([]Ref, string) {
-	ctes := map[string]bool{}
+	var scopes []map[string]bool
 	var vars []*pgq.RangeVar
 	dml := ""
+	hidden := func(name string) bool {
+		for _, s := range scopes {
+			if s[name] {
+				return true
+			}
+		}
+		return false
+	}
+	names := func(wc *pgq.WithClause) map[string]bool {
+		if wc == nil {
+			return nil
+		}
+		out := map[string]bool{}
+		for _, n := range wc.Ctes {
+			if c := n.GetCommonTableExpr(); c != nil {
+				out[c.Ctename] = true
+			}
+		}
+		return out
+	}
 	var walk func(m protoreflect.Message)
 	walk = func(m protoreflect.Message) {
+		var declared map[string]bool
 		switch x := m.Interface().(type) {
+		case *pgq.SelectStmt:
+			declared = names(x.WithClause)
+		case *pgq.InsertStmt:
+			declared = names(x.WithClause)
+		case *pgq.UpdateStmt:
+			declared = names(x.WithClause)
+		case *pgq.DeleteStmt:
+			declared = names(x.WithClause)
+		case *pgq.MergeStmt:
+			declared = names(x.WithClause)
 		case *pgq.RangeVar:
-			vars = append(vars, x)
+			if x.Schemaname != "" || !hidden(x.Relname) {
+				vars = append(vars, x)
+			}
 		case *pgq.CommonTableExpr:
-			ctes[x.Ctename] = true
 			if x.Ctequery != nil {
 				switch x.Ctequery.Node.(type) {
 				case *pgq.Node_InsertStmt:
@@ -178,6 +218,10 @@ func pgRefs(root *pgq.Node, sql string) ([]Ref, string) {
 					dml = "delete"
 				}
 			}
+		}
+		if declared != nil {
+			scopes = append(scopes, declared)
+			defer func() { scopes = scopes[:len(scopes)-1] }()
 		}
 		m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
 			switch {
@@ -193,11 +237,8 @@ func pgRefs(root *pgq.Node, sql string) ([]Ref, string) {
 		})
 	}
 	walk(root.ProtoReflect())
-	var out []Ref
+	out := make([]Ref, 0, len(vars))
 	for _, rv := range vars {
-		if rv.Schemaname == "" && ctes[rv.Relname] {
-			continue
-		}
 		out = append(out, pgRef(rv, sql))
 	}
 	return out, dml
@@ -279,7 +320,7 @@ func rewritePG(sql string, fn func(Ref) (string, string, bool)) (string, error) 
 		text       string
 	}
 	var edits []edit
-	moved := map[[2]string]string{} // (schema, name) written → new schema
+	moved := map[[2]string][2]string{} // (schema, name) written → new (schema, name)
 	for _, st := range tree.Stmts {
 		refs, _ := pgRefs(st.Stmt, sql)
 		for _, r := range refs {
@@ -296,7 +337,7 @@ func rewritePG(sql string, fn func(Ref) (string, string, bool)) (string, error) 
 			}
 			edits = append(edits, edit{r.start, r.end, txt})
 			if r.Schema != "" {
-				moved[[2]string{strings.ToLower(r.Schema), strings.ToLower(r.Name)}] = s
+				moved[[2]string{strings.ToLower(r.Schema), strings.ToLower(r.Name)}] = [2]string{s, n}
 			}
 		}
 	}
@@ -326,15 +367,25 @@ func rewritePG(sql string, fn func(Ref) (string, string, bool)) (string, error) 
 			if s0 == nil || s1 == nil {
 				continue
 			}
-			ns, ok := moved[[2]string{strings.ToLower(s0.Sval), strings.ToLower(s1.Sval)}]
-			if !ok || ns == "" {
+			to, ok := moved[[2]string{strings.ToLower(s0.Sval), strings.ToLower(s1.Sval)}]
+			if !ok {
 				continue
 			}
+			// schema.table.col → the same prefix as the rewritten FROM item
 			loc := int(c.Location)
-			end := scanIdent(sql, loc)
-			if end > loc {
-				edits = append(edits, edit{loc, end, QuotePG(ns)})
+			dot := scanIdent(sql, loc)
+			if dot <= loc || dot >= len(sql) || sql[dot] != '.' {
+				continue
 			}
+			end := scanIdent(sql, dot+1)
+			if end <= dot+1 {
+				continue
+			}
+			txt := QuotePG(to[1])
+			if to[0] != "" {
+				txt = QuotePG(to[0]) + "." + txt
+			}
+			edits = append(edits, edit{loc, end, txt})
 		}
 	}
 	if len(edits) == 0 {
@@ -474,8 +525,10 @@ func myFingerprint(sql string) string {
 		case *sqlparser.Literal, *sqlparser.NullVal:
 			c.Replace(arg)
 		case sqlparser.ValTuple:
-			c.Replace(sqlparser.ValTuple{arg})
-			return false
+			if literalOnly(n) { // IN lists and row values; (a, b) = (1, 2) keeps its columns
+				c.Replace(sqlparser.ValTuple{arg})
+				return false
+			}
 		case sqlparser.Values:
 			if len(n) > 1 {
 				c.Replace(n[:1])
@@ -488,6 +541,23 @@ func myFingerprint(sql string) string {
 	}, nil)
 	h := sha1.Sum([]byte(strings.ToLower(sqlparser.String(norm))))
 	return hex.EncodeToString(h[:8])
+}
+
+// literalOnly reports a tuple made only of literals, bind variables or such
+// tuples, the shape of an IN list.
+func literalOnly(t sqlparser.ValTuple) bool {
+	for _, e := range t {
+		switch x := e.(type) {
+		case *sqlparser.Literal, *sqlparser.NullVal, *sqlparser.Argument:
+		case sqlparser.ValTuple:
+			if !literalOnly(x) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func rewriteMy(sql string, fn func(Ref) (string, string, bool)) (string, error) {
