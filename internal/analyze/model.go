@@ -36,6 +36,10 @@ type Sample struct {
 	Err    string  `json:"err,omitempty"`
 }
 
+// Failed reports a request that never produced a response (connection
+// refused, timeout): its Ms is 0, so it must not enter latency or fit data.
+func (s Sample) Failed() bool { return s.Status == 0 && s.Err != "" }
+
 type ScalePoint struct {
 	Step   float64    `json:"step"`
 	N      float64    `json:"n"` // rows of the dominant table at this step
@@ -385,10 +389,15 @@ func nextStep(pts []ScalePoint, i int) float64 {
 func AnalyzeRoute(r *OpResult, p95Limit float64, maxQ float64) {
 	var e Expr
 	minConf := 2
+	analyzed, unknown := 0, 0
 	for _, q := range r.Queries {
 		if q.Kind == "other" || q.BigO == "" {
 			continue
 		}
+		if q.BigO == "unknown" {
+			unknown++
+		}
+		analyzed++
 		qe := q.Expr
 		if len(qe.Terms) == 0 {
 			qe = Expr{Terms: []Term{T(nil, nil)}}
@@ -413,8 +422,8 @@ func AnalyzeRoute(r *OpResult, p95Limit float64, maxQ float64) {
 	r.BigO = e.String()
 	r.Dominant = e.Dominant()
 	r.Confidence = []string{"low", "medium", "high"}[minConf]
-	if len(r.Queries) == 0 {
-		r.Confidence = "n/a"
+	if analyzed == 0 {
+		r.Confidence = "n/a" // nothing was measured, so no confidence to report
 	}
 	status := "OK"
 	bump := func(s, why string) {
@@ -423,6 +432,9 @@ func AnalyzeRoute(r *OpResult, p95Limit float64, maxQ float64) {
 			status = s
 		}
 		r.Reasons = append(r.Reasons, why)
+	}
+	if unknown > 0 {
+		bump("OK", fmt.Sprintf("%d of %d queries could not be analysed (no plan); the Big O above leaves them out", unknown, analyzed))
 	}
 	if d := e.NDegree(); d >= 2 {
 		bump("FAIL", fmt.Sprintf("superlinear in data size (%s)", r.BigO))
@@ -438,7 +450,11 @@ func AnalyzeRoute(r *OpResult, p95Limit float64, maxQ float64) {
 		bump("WARN", fmt.Sprintf("app-side work grows ~k^%s", FmtSlope(r.AppSlope, r.AppSlopeCI)))
 	}
 	if p95Limit > 0 && r.Latency.P95 > p95Limit {
-		bump("FAIL", fmt.Sprintf("p95 %.0fms > %.0fms", r.Latency.P95, p95Limit))
+		why := fmt.Sprintf("p95 %.0fms > %.0fms", r.Latency.P95, p95Limit)
+		if r.Latency.N > 0 && r.Latency.N < 20 {
+			why += fmt.Sprintf(" (only %d samples: p95 is the slowest one)", r.Latency.N)
+		}
+		bump("FAIL", why)
 	}
 	if maxQ > 0 && r.QPerReq > maxQ {
 		bump("WARN", fmt.Sprintf("%.0f queries/request > %.0f", r.QPerReq, maxQ))

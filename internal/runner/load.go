@@ -65,6 +65,11 @@ func cloneReq(q *inputs.Request) *inputs.Request {
 	return &c
 }
 
+// loadDrain is how long requests still in flight at a step's deadline get to
+// finish. They are the slowest ones; dropping them would make the saturated
+// levels look faster than they are.
+const loadDrain = 5 * time.Second
+
 func (r *Runner) loadLevel(ctx context.Context, pool []*inputs.Request, conc int, d time.Duration) analyze.LoadStep {
 	step := analyze.LoadStep{Concurrency: conc, Waits: map[string]int{}, Blocked: map[string]int{}}
 	m0, _ := r.cap.Mark(ctx)
@@ -72,8 +77,10 @@ func (r *Runner) loadLevel(ctx context.Context, pool []*inputs.Request, conc int
 	var lat []float64
 	traces := map[string]bool{}
 	var next, errs int64
-	lctx, cancel := context.WithTimeout(ctx, d)
+	lctx, cancel := context.WithTimeout(ctx, d) // stop starting requests
 	defer cancel()
+	rctx, rcancel := context.WithTimeout(ctx, d+loadDrain) // stop waiting for them
+	defer rcancel()
 	// DB activity sampler
 	sampDone := make(chan struct{})
 	go func() {
@@ -85,7 +92,7 @@ func (r *Runner) loadLevel(ctx context.Context, pool []*inputs.Request, conc int
 			case <-lctx.Done():
 				return
 			case <-t.C:
-				s, err := r.db.LoadSample(ctx)
+				s, err := r.db.LoadSample(lctx)
 				if err != nil {
 					continue
 				}
@@ -114,9 +121,9 @@ func (r *Runner) loadLevel(ctx context.Context, pool []*inputs.Request, conc int
 				if r.cfg.TraceOn() {
 					req.Header["traceparent"] = "00-" + trace + "-" + span + "-01"
 				}
-				status, _, _, ms, err := r.send(lctx, req)
-				if lctx.Err() != nil && err != nil {
-					return // cut off by the deadline
+				status, _, _, ms, err := r.send(rctx, req)
+				if ctx.Err() != nil {
+					return // the whole run was cancelled
 				}
 				mu.Lock()
 				if err != nil || status >= 400 || status == 0 {

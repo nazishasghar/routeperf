@@ -2,6 +2,7 @@ package analyze
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 
@@ -132,6 +133,23 @@ func (a AdviseCtx) leading(table, col string) (string, []string) {
 	return "", nil
 }
 
+// setsAny reports whether an UPDATE's SET clause assigns any of cols. When the
+// clause cannot be located it answers yes, so the advice is not lost.
+func setsAny(sql string, cols []string) bool {
+	m := reSetClause.FindStringSubmatch(sql)
+	if m == nil {
+		return true
+	}
+	for _, c := range cols {
+		if regexp.MustCompile("(?i)(^|[\\s,.`\"])" + regexp.QuoteMeta(c) + "[`\"]?\\s*=").MatchString(m[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+var reSetClause = regexp.MustCompile(`(?is)\bset\b(.*?)(?:\bwhere\b|\breturning\b|$)`)
+
 // Advise applies rule-based checks to a route's queries.
 func Advise(r *OpResult, ac AdviseCtx) {
 	tableRows, unindexedFK, cols := ac.TableRows, ac.UnindexedFK, ac.Cols
@@ -233,7 +251,9 @@ func Advise(r *OpResult, ac AdviseCtx) {
 					if in.Op == plan.OpFilter && len(in.Children) > 0 {
 						in = in.Children[0]
 					}
-					if in.Op == plan.OpSeqScan && in.Loops > 10 {
+					// a scan of a tiny table per loop is the right plan, not a missing index
+					perLoop := (in.Rows + in.RowsRemoved) / math.Max(in.Loops, 1)
+					if in.Op == plan.OpSeqScan && in.Loops > 10 && (tableRows[in.Relation] >= 10000 || perLoop >= 10000) {
 						var jc []string
 						for _, c := range filterCols(firstNonEmptyS(in.Filter, firstNonEmptyS(n.Filter, n.IndexCond))) {
 							if isCol(in.Relation, c) {
@@ -255,7 +275,8 @@ func Advise(r *OpResult, ac AdviseCtx) {
 			}
 			if n.Scan && n.Relation != "" && n.EstRows > 0 && n.Loops > 0 {
 				act := n.Rows / n.Loops
-				if act > 100 && (act/n.EstRows > 10 || n.EstRows/act > 10) {
+				// under a LIMIT the scan stops early, so far fewer rows than estimated is normal
+				if act > 100 && (act/n.EstRows > 10 || (!hasLimit && n.EstRows/act > 10)) {
 					add(Advice{Rule: "stale_stats", Query: q.ID, Message: fmt.Sprintf("Row estimate %.0f vs actual %.0f on %s", n.EstRows, act, firstNonEmptyS(n.Relation, n.RawType)), SQL: ac.analyzeSQL(n.Relation)})
 				}
 			}
@@ -269,7 +290,11 @@ func Advise(r *OpResult, ac AdviseCtx) {
 		if q.Kind == "delete" || q.Kind == "update" {
 			for _, rel := range q.Base.Relations() {
 				for _, child := range unindexedFK[rel] {
-					ct, cc, _ := strings.Cut(child, "|")
+					seg := strings.Split(child, "|") // child | child cols | parent cols
+					ct, cc := seg[0], seg[1]
+					if q.Kind == "update" && len(seg) > 2 && !setsAny(q.SQL, strings.Split(seg[2], ",")) {
+						continue // the FK check only runs when the referenced key changes
+					}
 					cols := strings.Split(cc, ",")
 					add(Advice{Rule: "unindexed_fk", Query: q.ID, Message: fmt.Sprintf("FK %s(%s) has no index; every %s on %s scans %s", ct, cc, strings.ToUpper(q.Kind), rel, ct),
 						SQL: ac.createIndex(ct, cols)})

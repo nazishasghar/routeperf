@@ -129,6 +129,9 @@ func perTableExpr(q *QueryResult, joint, jointCI float64) (Expr, string, bool) {
 	if len(grow) == 0 {
 		return Expr{}, note, true
 	}
+	if jointCI >= 9.99 || math.IsNaN(jointCI) || math.IsInf(jointCI, 0) {
+		jointCI = 0 // 9.99 stands for "no interval": keep the default tolerance
+	}
 	tol := math.Max(0.35, jointCI)
 	if len(grow) >= 2 && math.Abs(sum-joint) <= tol {
 		vars := map[string]float64{}

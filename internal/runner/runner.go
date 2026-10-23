@@ -721,7 +721,7 @@ func (r *Runner) analyzeAll(ctx context.Context, results []*analyze.OpResult) {
 	unindexed := map[string][]string{}
 	for _, f := range r.fks {
 		if f.Declared && !f.Indexed {
-			unindexed[f.Parent] = append(unindexed[f.Parent], f.Child+"|"+strings.Join(f.ChildCols, ","))
+			unindexed[f.Parent] = append(unindexed[f.Parent], f.Child+"|"+strings.Join(f.ChildCols, ",")+"|"+strings.Join(f.ParentCols, ","))
 		}
 	}
 	tableRows := map[string]float64{}
@@ -902,8 +902,11 @@ func (r *Runner) runOpWith(ctx context.Context, j Job, overrides func(i int) map
 	}
 	var lat []float64
 	for _, s := range res.Samples {
-		lat = append(lat, s.Ms)
 		res.Statuses[s.Status]++
+		if s.Failed() {
+			continue
+		}
+		lat = append(lat, s.Ms)
 	}
 	res.Latency = analyze.Latency{P50: analyze.Percentile(lat, 50), P95: analyze.Percentile(lat, 95), P99: analyze.Percentile(lat, 99), N: len(lat)}
 	label := o.Path
