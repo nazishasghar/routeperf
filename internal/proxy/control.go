@@ -53,19 +53,7 @@ func (p *Proxy) ServeControl(addr string) (*http.Server, error) {
 	mux.HandleFunc("GET /window", func(w http.ResponseWriter, r *http.Request) {
 		from, _ := strconv.ParseInt(r.URL.Query().Get("from"), 10, 64)
 		to, _ := strconv.ParseInt(r.URL.Query().Get("to"), 10, 64)
-		p.mu.Lock()
-		lo, hi := from-p.base, to-p.base
-		if lo < 0 {
-			lo = 0
-		}
-		if hi > int64(len(p.recs)) {
-			hi = int64(len(p.recs))
-		}
-		out := []wireRecord{}
-		for _, rc := range p.recs[min(lo, hi):hi] {
-			out = append(out, wireRecord{rc.sql, rc.params, rc.ms, rc.conn})
-		}
-		p.mu.Unlock()
+		out := p.window(from, to)
 		_ = json.NewEncoder(w).Encode(out)
 	})
 	ln, err := net.Listen("tcp", addr)
@@ -205,4 +193,21 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// window returns the records between two marks. Marks older than the trimmed
+// history yield what is left, never a bad slice range.
+func (p *Proxy) window(from, to int64) []wireRecord {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	lo, hi := from-p.base, to-p.base
+	lo = max(lo, 0)
+	hi = min(hi, int64(len(p.recs))) // a window fully inside trimmed history ends below 0
+	hi = max(hi, 0)
+	lo = min(lo, hi)
+	out := []wireRecord{}
+	for _, rc := range p.recs[lo:hi] {
+		out = append(out, wireRecord{rc.sql, rc.params, rc.ms, rc.conn})
+	}
+	return out
 }

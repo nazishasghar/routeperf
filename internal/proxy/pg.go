@@ -40,6 +40,7 @@ type pgPortal struct {
 
 type pgPending struct {
 	simple bool
+	turn   int // client batch (Sync/simple Query) the statement belongs to
 	sql    string
 	params []string
 	start  time.Time
@@ -54,6 +55,11 @@ type pgConn struct {
 	portals  map[string]*pgPortal
 	describe []string // statement names awaiting ParameterDescription
 	pending  []pgPending
+	// sent counts client batches (Sync or simple Query) and done the
+	// ReadyForQuery replies matched to them, so a reply only ever settles
+	// its own batch even when the client pipelines the next one.
+	sent, done   int
+	simpleFailed bool // the running simple Query got an ErrorResponse
 }
 
 func readStartup(r io.Reader) ([]byte, error) {
@@ -216,7 +222,10 @@ func (pc *pgConn) onClient(t byte, b []byte) {
 	switch t {
 	case 'Q':
 		sql, _ := cstring(b)
-		pc.pending = append(pc.pending, pgPending{simple: true, sql: sql, start: time.Now()})
+		pc.pending = append(pc.pending, pgPending{simple: true, turn: pc.sent, sql: sql, start: time.Now()})
+		pc.sent++
+	case 'S': // Sync ends an extended-protocol batch
+		pc.sent++
 	case 'P':
 		name, rest := cstring(b)
 		sql, rest := cstring(rest)
@@ -246,7 +255,7 @@ func (pc *pgConn) onClient(t byte, b []byte) {
 	case 'E':
 		portal, _ := cstring(b)
 		if pt := pc.portals[portal]; pt != nil {
-			pc.pending = append(pc.pending, pgPending{sql: pt.sql, params: pt.params, start: time.Now()})
+			pc.pending = append(pc.pending, pgPending{turn: pc.sent, sql: pt.sql, params: pt.params, start: time.Now()})
 		}
 	case 'C':
 		if len(b) > 0 && b[0] == 'S' {
@@ -278,14 +287,22 @@ func (pc *pgConn) onServer(t byte, b []byte) {
 		if len(pc.pending) > 0 && !pc.pending[0].simple {
 			pc.finish(pc.pending[0], t == 'E')
 			pc.pending = pc.pending[1:]
+		} else if len(pc.pending) > 0 && t == 'E' {
+			pc.simpleFailed = true // a simple Query's error; recorded when its ReadyForQuery arrives
 		}
 	case 'Z':
-		if len(pc.pending) > 0 && pc.pending[0].simple {
-			pc.finish(pc.pending[0], false)
+		if pc.done >= pc.sent {
+			return // the ReadyForQuery that follows the startup handshake
+		}
+		turn := pc.done
+		pc.done++
+		if len(pc.pending) > 0 && pc.pending[0].simple && pc.pending[0].turn == turn {
+			pc.finish(pc.pending[0], pc.simpleFailed)
 			pc.pending = pc.pending[1:]
 		}
-		// after an error the server skips the batch's remaining Executes
-		for len(pc.pending) > 0 && !pc.pending[0].simple {
+		pc.simpleFailed = false
+		// after an error the server skips this batch's remaining Executes
+		for len(pc.pending) > 0 && !pc.pending[0].simple && pc.pending[0].turn == turn {
 			pc.pending = pc.pending[1:]
 		}
 		pc.describe = nil
@@ -456,40 +473,52 @@ func pgNumeric(v []byte) string {
 	return s
 }
 
-// pgArray renders a one-dimensional binary array as an array literal.
+// pgArray renders a binary array as an array literal, nesting one level of
+// braces per dimension.
 func pgArray(v []byte) string {
 	if len(v) < 12 {
 		return "{}"
 	}
 	ndim := int(binary.BigEndian.Uint32(v))
 	elem := binary.BigEndian.Uint32(v[8:])
-	if ndim == 0 {
+	if ndim <= 0 || ndim > 6 || len(v) < 12+8*ndim {
 		return "{}"
 	}
-	if ndim != 1 || len(v) < 20 {
-		return "{}"
+	dims := make([]int, ndim)
+	for i := range dims {
+		dims[i] = int(binary.BigEndian.Uint32(v[12+8*i:]))
 	}
-	n := int(binary.BigEndian.Uint32(v[12:]))
-	b := v[20:]
-	var parts []string
-	for i := 0; i < n && len(b) >= 4; i++ {
-		l := int32(binary.BigEndian.Uint32(b))
-		b = b[4:]
-		if l < 0 {
-			parts = append(parts, "NULL")
-			continue
+	b := v[12+8*ndim:]
+	var render func(d int) string
+	render = func(d int) string {
+		var parts []string
+		for i := 0; i < dims[d]; i++ {
+			if d+1 < ndim {
+				parts = append(parts, render(d+1))
+				continue
+			}
+			if len(b) < 4 {
+				break
+			}
+			l := int32(binary.BigEndian.Uint32(b))
+			b = b[4:]
+			if l < 0 {
+				parts = append(parts, "NULL")
+				continue
+			}
+			if int(l) > len(b) {
+				break
+			}
+			s := pgBinary(elem, b[:l])
+			b = b[l:]
+			if elem == 25 || elem == 1043 || elem == 2950 {
+				s = `"` + strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), `"`, `\"`) + `"`
+			}
+			parts = append(parts, s)
 		}
-		if int(l) > len(b) {
-			break
-		}
-		s := pgBinary(elem, b[:l])
-		b = b[l:]
-		if elem == 25 || elem == 1043 || elem == 2950 {
-			s = `"` + strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), `"`, `\"`) + `"`
-		}
-		parts = append(parts, s)
+		return "{" + strings.Join(parts, ",") + "}"
 	}
-	return "{" + strings.Join(parts, ",") + "}"
+	return render(0)
 }
 
 func (p *Proxy) probeQuery(ctx context.Context, token string) error {
