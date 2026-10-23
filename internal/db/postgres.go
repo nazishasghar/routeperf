@@ -548,7 +548,7 @@ func (p *pg) Window(ctx context.Context, from, to Mark) ([]analyze.Stmt, error) 
 			lastByPid[e.pid] = len(out) - 1
 		case "DETAIL":
 			i, ok := lastByPid[e.pid]
-			if !ok || !strings.HasPrefix(e.msg, "Parameters:") || out[i].Params != nil {
+			if !ok || !hasPrefixFold(e.msg, "parameters:") || out[i].Params != nil {
 				continue
 			}
 			out[i].Params = ParsePGParams(e.msg)
@@ -614,14 +614,17 @@ func (p *pg) Explain(ctx context.Context, st analyze.Stmt, tgt Target) (*plan.Pl
 		case tgt.Only != nil:
 			return nil, fmt.Errorf("per-table replay needs a parsable statement: %w", err)
 		default: // unparsable: unqualified names via search_path, qualified ones by regex
-			schemas := map[string][]string{}
+			schemas := map[string]map[string]string{}
 			for _, k := range st.Tables {
 				if tb := p.cat[k]; tb != nil {
-					schemas[tb.Schema] = append(schemas[tb.Schema], tb.Name)
+					if schemas[tb.Schema] == nil {
+						schemas[tb.Schema] = map[string]string{}
+					}
+					schemas[tb.Schema][tb.Name] = tb.NSName() // the copy of sales.orders is sales__orders
 				}
 			}
 			for s, ts := range schemas {
-				sql = sqlutil.RewriteSchema(sql, s, tgt.NS, ts)
+				sql = sqlutil.RewriteSchemaAs(sql, s, tgt.NS, ts)
 			}
 			if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path = %s, %s", qpg(tgt.NS), p.path)); err != nil {
 				return nil, err
@@ -1186,4 +1189,10 @@ WHERE NOT l.granted AND l.database = (SELECT oid FROM pg_database WHERE datname 
 		rows.Close()
 	}
 	return s, nil
+}
+
+// hasPrefixFold is a case-insensitive strings.HasPrefix: servers print the
+// bind-parameter detail as "parameters:" while older notes spell it "Parameters:".
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
 }

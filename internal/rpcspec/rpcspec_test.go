@@ -161,3 +161,38 @@ func TestParseOpenRPC(t *testing.T) {
 		t.Error("discover error should fail")
 	}
 }
+
+func TestSchemaBounds(t *testing.T) {
+	tests := []struct {
+		name     string
+		schema   string
+		min, max *float64
+	}{
+		{"exclusive keeps stricter minimum", `{"type":"integer","minimum":5,"exclusiveMinimum":0}`, ptr(5), nil},
+		{"integer exclusive above fraction", `{"type":"integer","exclusiveMinimum":2.5}`, ptr(3), nil},
+		{"negative zod", `{"type":"number","exclusiveMaximum":0}`, nil, ptr(-1)},
+		{"exclusive max keeps stricter maximum", `{"type":"integer","maximum":3,"exclusiveMaximum":10}`, nil, ptr(3)},
+		{"draft 4 flag", `{"type":"integer","minimum":1,"exclusiveMinimum":true}`, ptr(2), nil},
+		{"anyOf single branch keeps parent bounds", `{"minimum":5,"anyOf":[{"type":"integer"}]}`, ptr(5), nil},
+	}
+	eq := func(a, b *float64) bool { return (a == nil) == (b == nil) && (a == nil || *a == *b) }
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var v any
+			if err := json.Unmarshal([]byte(tt.schema), &v); err != nil {
+				t.Fatal(err)
+			}
+			s := Schema(v, nil)
+			if !eq(s.Min, tt.min) || !eq(s.Max, tt.max) {
+				t.Fatalf("min/max = %v/%v, want %v/%v", deref(s.Min), deref(s.Max), deref(tt.min), deref(tt.max))
+			}
+		})
+	}
+}
+
+func deref(f *float64) any {
+	if f == nil {
+		return nil
+	}
+	return *f
+}

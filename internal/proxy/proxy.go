@@ -91,6 +91,7 @@ func New(dbURL, listen string, catalog func() map[string]*db.Table) (*Proxy, err
 }
 
 func (p *Proxy) accept() {
+	var wait time.Duration
 	for {
 		c, err := p.ln.Accept()
 		if err != nil {
@@ -99,11 +100,21 @@ func (p *Proxy) accept() {
 				return
 			default:
 			}
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
+			if errors.Is(err, net.ErrClosed) {
+				return
 			}
-			return
+			// EMFILE, ECONNABORTED and the like are transient: back off and keep
+			// serving, or every later connection hangs and no SQL is captured
+			if wait = min(max(2*wait, 5*time.Millisecond), time.Second); wait > 0 {
+				select {
+				case <-p.closed:
+					return
+				case <-time.After(wait):
+				}
+			}
+			continue
 		}
+		wait = 0
 		p.wg.Add(1)
 		p.mu.Lock()
 		p.conns++

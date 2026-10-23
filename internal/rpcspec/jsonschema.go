@@ -4,6 +4,7 @@
 package rpcspec
 
 import (
+	"math"
 	"net/url"
 	"strings"
 
@@ -53,16 +54,22 @@ func conv(v, root any, depth int) *openapi3.Schema {
 		s.Example = ex
 	}
 	s.Min, s.Max = num(m["minimum"]), num(m["maximum"])
-	// exclusive bounds: a number (2019+) or a flag on minimum (draft 4)
+	// exclusive bounds: a number (2019+) or a flag on minimum (draft 4); they
+	// tighten the inclusive bound, never replace a stricter one
+	integer := s.Type.Is("integer")
 	if x := num(m["exclusiveMinimum"]); x != nil {
-		s.Min = ptr(*x + 1)
+		s.Min = tighterMin(s.Min, above(*x, integer))
 	} else if b, _ := m["exclusiveMinimum"].(bool); b && s.Min != nil {
-		s.Min = ptr(*s.Min + 1)
+		s.Min = above(*s.Min, integer)
 	}
 	if x := num(m["exclusiveMaximum"]); x != nil {
-		s.Max = ptr(*x - 1)
+		s.Max = tighterMax(s.Max, below(*x, integer))
 	} else if b, _ := m["exclusiveMaximum"].(bool); b && s.Max != nil {
-		s.Max = ptr(*s.Max - 1)
+		s.Max = below(*s.Max, integer)
+	}
+	if s.Min != nil && s.Max != nil && *s.Min > *s.Max { // open interval narrower than the +/-1 step
+		mid := (*s.Min + *s.Max) / 2
+		s.Min, s.Max = ptr(mid), ptr(mid)
 	}
 	if x := num(m["minLength"]); x != nil {
 		s.MinLength = uint64(*x)
@@ -125,6 +132,18 @@ func conv(v, root any, depth int) *openapi3.Schema {
 			}
 			if inner.Example == nil {
 				inner.Example = s.Example
+			}
+			if inner.Min == nil {
+				inner.Min = s.Min
+			}
+			if inner.Max == nil {
+				inner.Max = s.Max
+			}
+			if len(inner.Enum) == 0 {
+				inner.Enum = s.Enum
+			}
+			if inner.Format == "" {
+				inner.Format = s.Format
 			}
 			return inner
 		}
@@ -195,6 +214,35 @@ func num(v any) *float64 {
 }
 
 func ptr(f float64) *float64 { return &f }
+
+// above and below give the nearest valid value just past an exclusive bound.
+func above(x float64, integer bool) *float64 {
+	if integer {
+		return ptr(math.Floor(x) + 1)
+	}
+	return ptr(x + 1)
+}
+
+func below(x float64, integer bool) *float64 {
+	if integer {
+		return ptr(math.Ceil(x) - 1)
+	}
+	return ptr(x - 1)
+}
+
+func tighterMin(cur, v *float64) *float64 {
+	if cur != nil && *cur >= *v {
+		return cur
+	}
+	return v
+}
+
+func tighterMax(cur, v *float64) *float64 {
+	if cur != nil && *cur <= *v {
+		return cur
+	}
+	return v
+}
 
 func uptr(f float64) *uint64 {
 	u := uint64(f)

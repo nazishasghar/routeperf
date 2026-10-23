@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -181,7 +182,7 @@ func Terminal(w io.Writer, res *runner.Result) {
 
 func human(v float64) string {
 	switch {
-	case v >= 1e6:
+	case v >= 1e6 || math.Round(v/1e3) >= 1000: // 999.6k rounds up to 1000k: say 1.0M
 		return fmt.Sprintf("%.1fM", v/1e6)
 	case v >= 1e4:
 		return fmt.Sprintf("%.0fk", v/1e3)

@@ -495,7 +495,7 @@ func (r *Resolver) Build(ctx context.Context, op *spec.Operation, iter, k int, k
 		if !have {
 			continue
 		}
-		s := fmt.Sprint(val)
+		s := scalar(val)
 		switch p.In {
 		case "path":
 			req.PathParams[p.Name] = s
@@ -649,14 +649,21 @@ func (r *Resolver) gen(ctx context.Context, s *openapi3.Schema, name, path strin
 	}
 	if len(s.AllOf) > 0 {
 		merged := map[string]any{}
+		var scalarVal any
 		for _, sub := range s.AllOf {
 			if sub.Value != nil {
-				if m, ok := r.gen(ctx, sub.Value, name, path, iter, depth+1).(map[string]any); ok {
+				v := r.gen(ctx, sub.Value, name, path, iter, depth+1)
+				if m, ok := v.(map[string]any); ok {
 					for k, v := range m {
 						merged[k] = v
 					}
+				} else if scalarVal == nil {
+					scalarVal = v
 				}
 			}
+		}
+		if len(merged) == 0 && scalarVal != nil {
+			return scalarVal // allOf over a plain string/number schema
 		}
 		return merged
 	}
@@ -672,10 +679,14 @@ func (r *Resolver) gen(ctx context.Context, s *openapi3.Schema, name, path strin
 				return numOrString(a[iter%len(a)])
 			}
 		}
+		v := 1.0
 		if s.Min != nil {
-			return *s.Min
+			v = *s.Min
 		}
-		return 1
+		if s.Max != nil && v > *s.Max {
+			v = *s.Max
+		}
+		return v
 	case s.Type.Is("boolean"):
 		return true
 	case s.Type.Is("array"):
@@ -767,7 +778,7 @@ func typed(v any, s *openapi3.Schema) any {
 		case map[string]any, []any:
 			return v
 		}
-		return fmt.Sprint(v)
+		return scalar(v)
 	}
 	return v
 }

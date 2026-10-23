@@ -34,6 +34,9 @@ func appPoints(res *analyze.OpResult) []analyze.Point {
 	var pts []analyze.Point
 	for k, ss := range res.KSamples {
 		for _, smp := range ss {
+			if smp.Failed() {
+				continue
+			}
 			pts = append(pts, analyze.Point{X: float64(k), Y: math.Max(0, smp.Ms-sampleDBMs(smp))})
 		}
 	}
@@ -57,6 +60,9 @@ func appSlope(res *analyze.OpResult) (s, hw float64, significant bool) {
 	for _, k := range ks {
 		var v []float64
 		for _, smp := range res.KSamples[k] {
+			if smp.Failed() {
+				continue
+			}
 			v = append(v, math.Max(0, smp.Ms-sampleDBMs(smp)))
 		}
 		med[k] = analyze.Median(v)
@@ -82,6 +88,9 @@ func appSlope(res *analyze.OpResult) (s, hw float64, significant bool) {
 	var pts []analyze.Point
 	for _, k := range seg {
 		for _, smp := range res.KSamples[k] {
+			if smp.Failed() {
+				continue
+			}
 			pts = append(pts, analyze.Point{X: float64(k), Y: math.Max(0.01, smp.Ms-sampleDBMs(smp)-base)})
 		}
 	}
@@ -120,7 +129,12 @@ func (r *Runner) replay(ctx context.Context, res *analyze.OpResult) {
 	var stmtCounts []float64
 	nplus := map[string]bool{}
 	redundant := map[string]bool{}
+	answered := 0
 	for _, s := range res.Samples {
+		if s.Failed() {
+			continue // no response, so no statements to count
+		}
+		answered++
 		per := map[string]int{}
 		identical := map[string]int{}
 		distinct := map[string]map[string]bool{}
@@ -157,6 +171,9 @@ func (r *Runner) replay(ctx context.Context, res *analyze.OpResult) {
 			}
 		}
 	}
+	for _, a := range byFP {
+		a.counts = padZeros(a.counts, answered) // samples before the statement first appeared
+	}
 	res.QPerReq = analyze.Median(stmtCounts)
 
 	// k-axis aggregation
@@ -173,6 +190,9 @@ func (r *Runner) replay(ctx context.Context, res *analyze.OpResult) {
 		var lat, tdb []float64
 		perFP := map[string][]float64{}
 		for _, s := range res.KSamples[k] {
+			if s.Failed() {
+				continue
+			}
 			lat = append(lat, s.Ms)
 			cnt := map[string]float64{}
 			for _, st := range s.Stmts {
@@ -199,6 +219,7 @@ func (r *Runner) replay(ctx context.Context, res *analyze.OpResult) {
 		res.KLatency[k] = analyze.Median(lat)
 		kTdb[k] = analyze.Median(tdb)
 		for fp, v := range perFP {
+			v = padZeros(v, len(lat)) // requests at this k that never ran the statement
 			if kCount[fp] == nil {
 				kCount[fp] = map[int]float64{}
 			}
@@ -851,4 +872,13 @@ func splitValues(s string) []string {
 		}
 	}
 	return append(out, s[start:])
+}
+
+// padZeros extends per-request counts with zeros up to n requests: a median
+// over only the requests that ran a statement overstates how often it runs.
+func padZeros(v []float64, n int) []float64 {
+	for len(v) < n {
+		v = append(v, 0)
+	}
+	return v
 }

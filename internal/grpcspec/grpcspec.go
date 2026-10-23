@@ -190,7 +190,7 @@ func FromProtoFiles(ctx context.Context, files []string, importPaths []string) (
 	return out, nil
 }
 
-var readVerb = regexp.MustCompile(`^(Get|List|Search|Find|Read|Fetch|Query|Lookup|Count|Describe|BatchGet|Watch|Check|Stream)`)
+var readVerb = regexp.MustCompile(`^(Get|List|Search|Find|Read|Fetch|Query|Lookup|Count|Describe|BatchGet|Watch|Check|Stream)([A-Z_0-9]|$)`)
 
 var verbs = regexp.MustCompile(`^(Get|List|Search|Find|Read|Fetch|Query|Lookup|Count|Describe|BatchGet|Create|Update|Delete|Remove|Add|Set|Put|Patch|Upsert|Insert)`)
 

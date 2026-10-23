@@ -42,7 +42,7 @@ func TestRewritePG(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `SELECT o.id, "_rp_s10".orders.total FROM "_rp_s10"."orders" o JOIN users ON users.id = o.user_id, LATERAL (SELECT 1 FROM ONLY "_rp_s10"."items" i WHERE i.order_id = o.id) x WHERE o.id = 'it''s'`
+	want := `SELECT o.id, "_rp_s10"."orders".total FROM "_rp_s10"."orders" o JOIN users ON users.id = o.user_id, LATERAL (SELECT 1 FROM ONLY "_rp_s10"."items" i WHERE i.order_id = o.id) x WHERE o.id = 'it''s'`
 	if out != want {
 		t.Errorf("rewrite:\n got %s\nwant %s", out, want)
 	}
@@ -86,5 +86,52 @@ func TestRewriteMySQL(t *testing.T) {
 	}
 	if got := MySQLWhereProbe("UPDATE users SET name = 'x' WHERE id = 7"); got != "select 1 from users where id = 7" {
 		t.Errorf("probe: %s", got)
+	}
+}
+
+func TestRewritePGRenamedSchemaTable(t *testing.T) {
+	sql := `SELECT sales.orders.id FROM sales.orders WHERE sales.orders.total > 1`
+	out, err := Rewrite("postgres", sql, func(r Ref) (string, string, bool) {
+		return "_rp_s03", r.Schema + "__" + r.Name, r.Name == "orders"
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `SELECT "_rp_s03"."sales__orders".id FROM "_rp_s03"."sales__orders" WHERE "_rp_s03"."sales__orders".total > 1`
+	if out != want {
+		t.Fatalf("got  %s\nwant %s", out, want)
+	}
+}
+
+func TestParsePGCTEScope(t *testing.T) {
+	p := Parse("postgres", `SELECT * FROM orders WHERE cid IN (WITH orders AS (SELECT id FROM vip) SELECT id FROM orders)`)
+	names := p.Names()
+	sort.Strings(names)
+	if got := strings.Join(names, ","); got != "orders,vip" {
+		t.Errorf("names = %s: the outer orders table is not the CTE", got)
+	}
+	p = Parse("postgres", `WITH orders AS (SELECT 1 AS id) SELECT * FROM orders`)
+	if len(p.Names()) != 0 {
+		t.Errorf("CTE reference must not count as a table: %v", p.Names())
+	}
+}
+
+func TestParsePGMultiStatementIsNotReplayable(t *testing.T) {
+	p := Parse("postgres", "SELECT 1 FROM users; COMMIT; DELETE FROM users")
+	if p.Kind != "other" {
+		t.Fatalf("kind = %q: a multi-statement string must never be replayed", p.Kind)
+	}
+}
+
+func TestFingerprintMySQLKeepsRowConstructorColumns(t *testing.T) {
+	fp := func(q string) string { return Parse("mysql", q).Fingerprint }
+	if fp("SELECT * FROM t WHERE (a, b) = (1, 2)") == fp("SELECT * FROM t WHERE (c, d) = (3, 4)") {
+		t.Error("different columns must not share a fingerprint")
+	}
+	if fp("SELECT * FROM t WHERE id IN (1, 2, 3)") != fp("SELECT * FROM t WHERE id IN (9)") {
+		t.Error("IN lists of any length must still collapse")
+	}
+	if fp("SELECT * FROM t WHERE (a, b) IN ((1, 2), (3, 4))") != fp("SELECT * FROM t WHERE (a, b) IN ((5, 6))") {
+		t.Error("row-value IN lists must collapse")
 	}
 }

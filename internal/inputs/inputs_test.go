@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/nazishasghar/routeperf/internal/db"
 	"github.com/nazishasghar/routeperf/internal/spec"
 )
@@ -79,5 +80,29 @@ func TestAnchorsIgnoreCycleFKs(t *testing.T) {
 	}
 	if got := r.anchorPred(pm, "s", 0); !strings.Contains(got, `s."product_customer_id" IN (SELECT p0."id" FROM "product_customer" p0 WHERE hash(p0.id))`) {
 		t.Errorf("member anchors: %s", got)
+	}
+}
+
+func TestScalarKeepsLargeNumbersPlain(t *testing.T) {
+	for in, want := range map[any]string{
+		float64(1000000): "1000000", float64(1234567): "1234567", 1.5e7: "15000000",
+		0.25: "0.25", "abc": "abc", true: "true",
+	} {
+		if got := scalar(in); got != want {
+			t.Errorf("scalar(%v) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestGenAllOfScalarAndBounds(t *testing.T) {
+	r := New(fakeDB{}, nil, nil, nil)
+	enum := &openapi3.Schema{Type: &openapi3.Types{"string"}, Enum: []any{"a", "b"}}
+	allOf := &openapi3.Schema{AllOf: openapi3.SchemaRefs{{Value: enum}}}
+	if got := r.gen(context.Background(), allOf, "status", "/x", 0, 0); got != "a" {
+		t.Errorf("allOf over a string enum = %#v, want \"a\"", got)
+	}
+	neg := &openapi3.Schema{Type: &openapi3.Types{"number"}, Max: func() *float64 { v := -1.0; return &v }()}
+	if got := r.gen(context.Background(), neg, "delta", "/x", 0, 0); got != -1.0 {
+		t.Errorf("value for max -1 = %#v, want -1", got)
 	}
 }
